@@ -7,14 +7,13 @@ export const INSTALL = "npm install -g oh-my-gigabytes";
 
 export const doc = (path: string) => `${REPO}/blob/main/${path}`;
 
-export const SITE = (process.env.NEXT_PUBLIC_SITE_URL ?? "https://oh-my-gigabytes.com").replace(/\/$/, "");
+export const SITE = (process.env.NEXT_PUBLIC_SITE_URL ?? "https://www.oh-my-gigabytes.com").replace(/\/$/, "");
 export const NAME = "OMG (Oh My Gigabytes)";
 export const TAGLINE = "See where your disk space went and take it back, from the terminal.";
 export const DESCRIPTION =
   "OMG is a free, open source, keyboard-first disk space analyzer for developers on macOS, Linux and Windows. It finds tool caches, build folders, old toolchains, Docker leftovers and large files, explains each one, and deletes only what you confirm.";
 
 export const SPONSOR_PRICE = "$49.99";
-export const SPONSOR_SLOTS = 6;
 export const X_URL = "https://x.com/akramcodez";
 export const SPONSOR_CONTACT = X_URL;
 

@@ -1,9 +1,8 @@
 import { LuPlus } from "react-icons/lu";
 import SponsorLogo from "@/components/SponsorLogo";
-import { REPO, SPONSORS, SPONSOR_CHECKOUT, SPONSOR_PRICE, SPONSOR_SLOTS, X_URL } from "@/lib/site";
+import { REPO, SPONSORS, SPONSOR_CHECKOUT, SPONSOR_PRICE, X_URL } from "@/lib/site";
 
 export default function Sponsors() {
-  const empty = Math.max(SPONSOR_SLOTS - SPONSORS.length, 1);
   return (
     <>
       <div className="section-head">
@@ -11,8 +10,7 @@ export default function Sponsors() {
           Lifetime brand exposure, <em>one payment.</em>
         </h2>
         <p className="section-lead">
-          Showcase your product to developers on OMG and get a dedicated shoutout on X. Click an empty slot to add
-          your logo.
+          Showcase your product to developers on OMG and get a dedicated shoutout on X.
         </p>
         <p className="sponsor-price">
           <span className="sponsor-amount">{SPONSOR_PRICE}</span>
@@ -28,28 +26,29 @@ export default function Sponsors() {
           </a>
         </p>
       </div>
-      <ul className="grid sponsor-grid">
-        {SPONSORS.map((s) => (
-          <li key={s.name}>
-            <a className="slot" href={s.url} target="_blank" rel={s.house ? "noopener" : "sponsored noopener"}>
-              <SponsorLogo sponsor={s} className="slot-logo" size={48} alt="" />
-              <h3>{s.name}</h3>
-              {s.tagline && <p>{s.tagline}</p>}
-            </a>
-          </li>
-        ))}
-        {Array.from({ length: empty }, (_, i) => (
-          <li key={`open-${i}`}>
-            <a className="slot is-open" href={SPONSOR_CHECKOUT} target="_blank" rel="noopener" aria-label={`Add your brand for ${SPONSOR_PRICE}`}>
-              <span className="slot-plus" aria-hidden="true">
+      <div className="sponsor-shelf">
+        <p className="sponsor-hint">Click an empty slot to add your logo</p>
+        <ul className="sponsor-icons">
+          {SPONSORS.map((s) => (
+            <li key={s.name}>
+              <a className="icon-slot" href={s.url} target="_blank" rel={s.house ? "noopener" : "sponsored noopener"}>
+                <span className="icon-box">
+                  <SponsorLogo sponsor={s} size={96} alt="" />
+                </span>
+                <span className="icon-name">{s.name}</span>
+              </a>
+            </li>
+          ))}
+          <li>
+            <a className="icon-slot is-open" href={SPONSOR_CHECKOUT} target="_blank" rel="noopener" aria-label={`Add your brand for ${SPONSOR_PRICE}`}>
+              <span className="icon-box" aria-hidden="true">
                 <LuPlus />
               </span>
-              <h3>Your brand here</h3>
-              <p>Add yours &middot; {SPONSOR_PRICE}</p>
+              <span className="icon-name">Add yours</span>
             </a>
           </li>
-        ))}
-      </ul>
+        </ul>
+      </div>
     </>
   );
 }
