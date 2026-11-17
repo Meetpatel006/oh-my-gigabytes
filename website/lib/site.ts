@@ -13,17 +13,32 @@ export const TAGLINE = "See where your disk space went and take it back, from th
 export const DESCRIPTION =
   "OMG is a free, open source, keyboard-first disk space analyzer for developers on macOS, Linux and Windows. It finds tool caches, build folders, old toolchains, Docker leftovers and large files, explains each one, and deletes only what you confirm.";
 
+export const SPONSOR_EMAIL = "skakram00zz@gmail.com";
 export const SPONSOR_PRICE = "$49.99";
 export const X_URL = "https://x.com/akramcodez";
 export const SPONSOR_CONTACT = X_URL;
 
 const DODO_CHECKOUT = (process.env.NEXT_PUBLIC_DODO_CHECKOUT_URL ?? "https://checkout.dodopayments.com").replace(/\/$/, "");
 const DODO_PRODUCT = process.env.NEXT_PUBLIC_DODO_SPONSOR_PRODUCT ?? "";
-export const SPONSOR_CHECKOUT = DODO_PRODUCT
-  ? `${DODO_CHECKOUT}/buy/${DODO_PRODUCT}?quantity=1&redirect_url=${encodeURIComponent(`${SITE}/sponsor/thanks`)}`
-  : SPONSOR_CONTACT;
+export const SPONSOR_PAYMENTS = DODO_PRODUCT !== "";
+
+export type SponsorForm = { name: string; link: string; description: string; email: string };
+
+export function sponsorCheckout(form: SponsorForm) {
+  const q = new URLSearchParams({
+    quantity: "1",
+    email: form.email,
+    metadata_source: "website",
+    metadata_sponsor_name: form.name,
+    metadata_sponsor_link: form.link,
+    metadata_sponsor_description: form.description,
+    metadata_sponsor_email: form.email,
+    redirect_url: `${SITE}/sponsor/thanks`,
+  });
+  return `${DODO_CHECKOUT}/buy/${DODO_PRODUCT}?${q}`;
+}
 
 export type Sponsor = { name: string; tagline: string; url: string; logo?: string; logoDark?: string; house?: boolean };
 export const SPONSORS: Sponsor[] = [
-  { name: "Oh My Gigabytes", tagline: "", url: REPO, logo: "/icon-light.svg", logoDark: "/icon-dark.svg", house: true },
+  { name: "Oh My Gigabytes", tagline: "", url: REPO, logo: "/logo-light.svg", logoDark: "/logo-dark.svg", house: true },
 ];
