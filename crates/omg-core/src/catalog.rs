@@ -6,9 +6,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_CATALOG: usize = 256 * 1024;
+const MAX_RULES: usize = 128;
 /// Builtin discovery kinds. A catalog can only refer to these. Only the store kinds take locations
 /// from a rule, and only as a validated `Store` inside the tool areas of the home folder.
-pub const DISCOVERIES: [&str; 40] = [
+pub const DISCOVERIES: [&str; 49] = [
     "npm_content_cache",
     "pip_cache",
     "uv_cache",
@@ -27,6 +28,8 @@ pub const DISCOVERIES: [&str; 40] = [
     "tool_caches",
     "tool_logs",
     "unrecognized_store",
+    "superseded_copies",
+    "old_installers",
     "colima_vm",
     "docker_desktop_vm",
     "unused_clone",
@@ -49,6 +52,13 @@ pub const DISCOVERIES: [&str; 40] = [
     "editor_old_extensions",
     "toolchain_old_versions",
     "home_logs_and_temp",
+    "go_modules",
+    "xcode_archives",
+    "android_avd",
+    "conda_envs",
+    "jetbrains_old_versions",
+    "app_leftovers",
+    "fast_growing",
 ];
 
 /// Logs and temporary files unchanged for this long are suggested.
@@ -315,6 +325,26 @@ const CLONE_SLACK_NS: i128 = 2_000_000_000;
 /// Smallest build output or application cache worth suggesting.
 const SUGGEST_MIN_BYTES: i64 = 50 << 20;
 
+/// A folder compared for copies: path, newest change, folded file names, bytes.
+type FolderCopy = (Vec<u8>, i64, BTreeSet<Vec<u8>>, u64);
+/// Old installers: unchanged this long, at least this big.
+const INSTALLER_DAYS: i64 = 30;
+const INSTALLER_MIN_BYTES: i64 = 10 << 20;
+const INSTALLER_EXTENSIONS: [&str; 22] = [
+    "dmg", "pkg", "mpkg", "xip", "iso", "msi", "msix", "exe", "appimage", "deb", "rpm", "apk",
+    "ipa", "zip", "tar", "tgz", "tar.gz", "tar.xz", "tar.bz2", "7z", "rar", "vsix",
+];
+/// Folder copies: the size of a folder worth comparing, how many groups and files are read.
+const COPY_MIN_BYTES: i64 = 10 << 20;
+const COPY_PARENTS: i64 = 300;
+const COPY_MAX_FILES: usize = 5_000;
+const COPY_ENTRY_BUDGET: usize = 300_000;
+const COPY_SIMILARITY: usize = 60;
+const ARTIFACT_EXTENSIONS: [&str; 34] = [
+    "tgz", "gz", "zip", "tar", "xz", "bz2", "zst", "7z", "whl", "jar", "war", "aar", "apk", "aab",
+    "ipa", "dmg", "pkg", "deb", "rpm", "msi", "exe", "dll", "so", "dylib", "a", "o", "lib", "wasm",
+    "node", "bin", "img", "iso", "sig", "map",
+];
 /// A store search gives up on a root after listing this many entries, so a wrong pattern stays cheap.
 const MAX_STORE_VISITS: usize = 200_000;
 /// Unrecognized stores: unchanged this long, at least this big, at most this deep below an area.
@@ -365,6 +395,19 @@ fn shared_discovery_root(kind: &str, home: &std::path::Path) -> Option<std::path
             absolute_env("OLLAMA_MODELS").unwrap_or_else(|| home.join(".ollama").join("models"))
         }
         "lm_studio_models" => home.join(".lmstudio").join("models"),
+        "go_modules" => absolute_env("GOMODCACHE").unwrap_or_else(|| {
+            std::env::var_os("GOPATH")
+                .and_then(|p| std::env::split_paths(&p).next())
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join("go"))
+                .join("pkg")
+                .join("mod")
+        }),
+        "android_avd" => absolute_env("ANDROID_AVD_HOME").unwrap_or_else(|| {
+            absolute_env("ANDROID_USER_HOME")
+                .unwrap_or_else(|| home.join(".android"))
+                .join("avd")
+        }),
         "deno_cache" => absolute_env("DENO_DIR")?,
         "playwright_browsers" => absolute_env("PLAYWRIGHT_BROWSERS_PATH")?,
         "composer_cache" => absolute_env("COMPOSER_CACHE_DIR")?,
@@ -455,6 +498,7 @@ fn macos_discovery_root(kind: &str, home: &std::path::Path) -> Option<std::path:
         "xcode_derived_data" => home.join("Library/Developer/Xcode/DerivedData"),
         "xcode_device_support" => home.join("Library/Developer/Xcode/iOS DeviceSupport"),
         "simulator_caches" => home.join("Library/Developer/CoreSimulator/Caches"),
+        "xcode_archives" => home.join("Library/Developer/Xcode/Archives"),
         "deno_cache" => caches.join("deno"),
         "cocoapods_cache" => caches.join("CocoaPods"),
         "playwright_browsers" => caches.join("ms-playwright"),
@@ -596,7 +640,166 @@ pub struct Finding {
     pub action: String,
     pub reason: String,
     pub evidence: String,
+    /// For build and dependency output: when its project was last worked on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
 }
+/// When a project was last worked on, from metadata only: its own files and folders, its build
+/// output and its `.git` folder (commits, checkouts and fetches write there). Unix seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activity {
+    pub source: Option<i64>,
+    pub build: Option<i64>,
+    pub git: Option<i64>,
+}
+impl Activity {
+    pub fn last(&self) -> Option<i64> {
+        [self.source, self.build, self.git]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+    fn describe(&self) -> Option<String> {
+        let days = |at: i64| (crate::now() - at).max(0) / 86_400;
+        let last = self.last()?;
+        let parts: Vec<String> = [
+            ("files", self.source),
+            ("last build", self.build),
+            ("Git", self.git),
+        ]
+        .into_iter()
+        .filter_map(|(what, at)| at.map(|at| format!("{what} {} days", days(at))))
+        .collect();
+        Some(format!(
+            "project last worked on {} days ago: {}",
+            days(last),
+            parts.join(", ")
+        ))
+    }
+}
+/// A folder that no finding explains, from `Index::unexplained`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Unexplained {
+    pub path: Vec<u8>,
+    pub allocated: u64,
+    /// What is left of `allocated` once the findings inside are taken away.
+    pub unexplained: u64,
+}
+const UNEXPLAINED_MIN_BYTES: u64 = 256 << 20;
+/// Growth between two scans this large is listed as a finding.
+const GROWTH_MIN_BYTES: i64 = 256 << 20;
+const CONDA_ENV_DAYS: i64 = 90;
+const LEFTOVER_DAYS: i64 = 90;
+
+/// The product and version of a JetBrains IDE folder (`IntelliJIdea2024.1`, `PyCharmCE2023.3`).
+fn ide_version(name: &str) -> Option<(String, Vec<u64>)> {
+    let start = name.find(|c: char| c.is_ascii_digit())?;
+    let (product, version) = name.split_at(start);
+    if product.len() < 2 || !product.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let parts: Vec<u64> = version
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    (parts.len() >= 2 && parts[0] >= 2000 && parts[0] < 3000).then(|| (product.to_string(), parts))
+}
+
+/// Where applications are installed on macOS, plus one level of folders inside them.
+fn application_folders(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/System/Applications"),
+        home.join("Applications"),
+    ];
+    let mut nested = Vec::new();
+    for folder in &out {
+        for entry in std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(2000)
+        {
+            let path = entry.path();
+            if path.extension().is_none() && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                nested.push(path);
+            }
+        }
+    }
+    out.extend(nested);
+    out
+}
+
+/// Names of the application bundles in `folders`, lower case with only letters and digits. Only
+/// the folder listings are read, never a bundle's contents.
+fn installed_apps(folders: &[std::path::PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for folder in folders {
+        for entry in std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(5000)
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(app) = name.strip_suffix(".app") {
+                out.push(squash(app));
+            }
+        }
+    }
+    out.retain(|a| a.len() >= 3);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Whether a Library folder named `name` (lower case) may belong to an installed application. A
+/// bundle identifier is matched part by part, so a vendor's other applications also count; when
+/// in doubt it counts as installed.
+fn app_installed(name: &str, apps: &[String]) -> bool {
+    let name = name.strip_suffix(".savedstate").unwrap_or(name);
+    let parts: Vec<String> = if name.contains('.') {
+        let parts: Vec<&str> = name.split('.').collect();
+        // A bundle identifier starts with a domain (`com`, `org`, `io`) or a team id or `group`.
+        parts.iter().skip(1).map(|p| squash(p)).collect()
+    } else {
+        vec![squash(name)]
+    };
+    let parts: Vec<String> = parts.into_iter().filter(|p| p.len() >= 3).collect();
+    if parts.is_empty() {
+        return true;
+    }
+    parts.iter().any(|part| {
+        apps.iter().any(|app| {
+            app == part
+                || (part.len() >= 4 && app.contains(part.as_str()))
+                || (app.len() >= 4 && part.contains(app.as_str()))
+        })
+    })
+}
+
+/// Projects worked on within this many days keep their build output out of suggestions.
+pub const PROJECT_ACTIVE_DAYS: i64 = 7;
+/// Folder names a build or package tool writes inside a project.
+const PROJECT_OUTPUT_NAMES: [&str; 10] = [
+    "bin",
+    "obj",
+    "vendor",
+    "deps",
+    "out",
+    "Library",
+    "Temp",
+    "Intermediate",
+    "Binaries",
+    "public",
+];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ignore {
     pub id: i64,
@@ -637,7 +840,8 @@ pub fn category_of(discovery: &str) -> Option<&'static str> {
         | "cocoapods_cache"
         | "composer_cache"
         | "playwright_browsers"
-        | "puppeteer_browsers" => "package_caches",
+        | "puppeteer_browsers"
+        | "go_modules" => "package_caches",
         "stale_dependencies" | "project_build_output" | "xcode_derived_data" => "build_artifacts",
         "large_file" => "large_files",
         "app_caches" | "xcode_device_support" | "simulator_caches" | "jetbrains_caches" => {
@@ -650,12 +854,18 @@ pub fn category_of(discovery: &str) -> Option<&'static str> {
         "tool_caches" => "app_caches",
         "tool_logs" => "logs_and_temp",
         "unrecognized_store" => "unrecognized",
+        "superseded_copies" => "duplicates",
+        "old_installers" => "old_downloads",
         "colima_vm" | "docker_desktop_vm" => "container_storage",
         "unused_clone" => "unused_clones",
         "unused_app_data" => "unused_apps",
         "unused_toolchain" => "unused_toolchains",
         "huggingface_hub" | "ollama_models" | "lm_studio_models" => "ml_models",
         "home_logs_and_temp" => "logs_and_temp",
+        "jetbrains_old_versions" => "old_tool_versions",
+        "xcode_archives" | "android_avd" | "conda_envs" => "developer_data",
+        "app_leftovers" => "app_leftovers",
+        "fast_growing" => "growth",
         _ => return None,
     })
 }
@@ -775,6 +985,70 @@ pub fn store_root(template: &str, home: &std::path::Path) -> Option<std::path::P
     };
     let root = rest.split('/').fold(start, |path, part| path.join(part));
     (root.starts_with(home) && tool_root_allowed(home, &root) && root != home).then_some(root)
+}
+
+/// A file that build or release tooling produces: archives, packages, binaries, libraries and
+/// checksums. A copy made of these is cheap to make again; a copy of photos or documents is not.
+fn build_artifact(name: &[u8]) -> bool {
+    let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+    match name.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => ARTIFACT_EXTENSIONS.contains(&ext),
+    }
+}
+
+/// A relative path with every version replaced by `#`: a run of digits and dots, with any
+/// prerelease suffix such as `-beta.2` or `-rc1`, so `app-1.2.0-beta.1.tgz` and `app-1.3.0.tgz`
+/// name the same file.
+fn fold_digits(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        if !path[i].is_ascii_digit() {
+            out.push(path[i]);
+            i += 1;
+            continue;
+        }
+        let digits = |mut j: usize| {
+            while j < path.len() && (path[j].is_ascii_digit() || path[j] == b'.') {
+                j += 1;
+            }
+            j
+        };
+        i = digits(i);
+        while path[..i].ends_with(b".") {
+            i -= 1;
+        }
+        if i < path.len() && matches!(path[i], b'-' | b'.') {
+            let rest = &path[i + 1..];
+            if let Some(tag) = ["alpha", "beta", "rc", "pre", "dev", "next", "r"]
+                .iter()
+                .find(|t| {
+                    rest.len() >= t.len() && rest[..t.len()].eq_ignore_ascii_case(t.as_bytes())
+                })
+            {
+                let mut j = i + 1 + tag.len();
+                if j < path.len() && path[j] == b'.' {
+                    j += 1;
+                }
+                if j < path.len() && path[j].is_ascii_digit() {
+                    i = digits(j);
+                    while path[..i].ends_with(b".") {
+                        i -= 1;
+                    }
+                }
+            }
+        }
+        out.push(b'#');
+    }
+    out
+}
+
+/// At least `COPY_SIMILARITY` percent of the two folders' files are the same.
+fn similar(a: &BTreeSet<Vec<u8>>, b: &BTreeSet<Vec<u8>>) -> bool {
+    let shared = a.intersection(b).count();
+    let all = a.len() + b.len() - shared;
+    all > 0 && shared * 100 >= all * COPY_SIMILARITY
 }
 
 /// The root template that names `path` on any machine: relative to the closest tool area, or to
@@ -960,7 +1234,7 @@ pub fn parse(payload: &str) -> Result<Catalog> {
         || catalog.engine_major != 0
         || catalog.version == 0
         || catalog.version > i64::MAX as u64
-        || catalog.rules.len() > 64
+        || catalog.rules.len() > MAX_RULES
     {
         bail!("unsupported catalog version/schema/engine or rule budget");
     }
@@ -1166,7 +1440,9 @@ impl Index {
         };
         let assemble = |rule: &Rule,
                         entry: Entry,
-                        subtree: Option<crate::rollup::Totals>|
+                        subtree: Option<crate::rollup::Totals>,
+                        note: Option<String>,
+                        activity: Option<Activity>|
          -> Result<Option<Finding>> {
             if !include_ignored
                 && ignores.iter().any(|i| {
@@ -1187,12 +1463,20 @@ impl Index {
                 &mut policy::RepositoryMemo::with_ages(&lookup),
             );
             let estimate = subtree.as_ref().map_or(entry.allocated, |t| t.allocated);
+            let explanation = match note
+                .into_iter()
+                .chain(activity.as_ref().and_then(Activity::describe))
+                .reduce(|a, b| format!("{a}; {b}"))
+            {
+                Some(note) => format!("{} ({note})", rule.explanation),
+                None => rule.explanation.clone(),
+            };
             let (effective, reason) = match &verdict.gate {
                 crate::cleanup::Gate::Denied(why) => ("protected", why.clone()),
                 crate::cleanup::Gate::Warn(why) => {
-                    (rule.tier.as_str(), format!("{} ⚠ {why}", rule.explanation))
+                    (rule.tier.as_str(), format!("{explanation} ⚠ {why}"))
                 }
-                crate::cleanup::Gate::Allowed => (rule.tier.as_str(), rule.explanation.clone()),
+                crate::cleanup::Gate::Allowed => (rule.tier.as_str(), explanation),
             };
             let totals = match (&subtree, rollups) {
                 (Some(t), _) => format!(
@@ -1227,6 +1511,7 @@ impl Index {
                 action: "info".into(),
                 reason,
                 evidence,
+                activity,
             }))
         };
         for rule in catalog.rules.iter().filter(applicable) {
@@ -1252,7 +1537,7 @@ impl Index {
             };
             directory_roots.push(entry.path.clone());
             let subtree = self.subtree(&entry.path)?;
-            output.extend(assemble(rule, entry, subtree)?);
+            output.extend(assemble(rule, entry, subtree, None, None)?);
         }
         // First, so that folders inside a clone are counted once, in the clone's own estimate.
         if let Some(rule) = catalog
@@ -1275,7 +1560,7 @@ impl Index {
                 };
                 directory_roots.push(entry.path.clone());
                 let subtree = self.subtree(&entry.path)?;
-                output.extend(assemble(rule, entry, subtree)?);
+                output.extend(assemble(rule, entry, subtree, None, None)?);
             }
         }
         if let Some(rule) = catalog
@@ -1304,7 +1589,8 @@ impl Index {
                 };
                 directory_roots.push(entry.path.clone());
                 let subtree = self.subtree(&entry.path)?;
-                output.extend(assemble(rule, entry, subtree)?);
+                let activity = self.project_activity(scan, crate::index::split_path(&path).0)?;
+                output.extend(assemble(rule, entry, subtree, None, Some(activity))?);
             }
         }
         let rule_of = |kind: &str| {
@@ -1342,11 +1628,27 @@ impl Index {
         if let Some(rule) = rule_of("toolchain_old_versions") {
             found.push((rule, self.toolchain_old_versions(scan, &root, &home)?));
         }
+        if let Some(rule) = rule_of("jetbrains_old_versions") {
+            found.push((rule, self.jetbrains_old_versions(scan, &root, &home)?));
+        }
+        if let Some(rule) = rule_of("conda_envs") {
+            found.push((rule, self.conda_envs(scan, &root, &home)?));
+        }
         if let Some(rule) = rule_of("home_logs_and_temp") {
             found.push((rule, self.home_logs_and_temp(scan, &root, &home)?));
         }
         if let Some(rule) = rule_of("unused_app_data") {
             found.push((rule, self.unused_app_data(scan, &root, &home)?));
+        }
+        // After app data: a folder old enough for both keeps that kind's suggestion.
+        if cfg!(target_os = "macos")
+            && let Some(rule) = rule_of("app_leftovers")
+        {
+            let apps = installed_apps(&application_folders(&home));
+            found.push((rule, self.app_leftovers(scan, &root, &home, &apps)?));
+        }
+        if let Some(rule) = rule_of("old_installers") {
+            found.push((rule, self.old_installers(scan, &root, &home)?));
         }
         let unrecognized = rule_of("unrecognized_store");
         for (rule, paths) in found {
@@ -1374,7 +1676,20 @@ impl Index {
                 } else {
                     None
                 };
-                output.extend(assemble(rule, entry, subtree)?);
+                let activity = (rule.discovery == "project_build_output")
+                    .then(|| self.project_activity(scan, crate::index::split_path(&path).0))
+                    .transpose()?;
+                output.extend(assemble(rule, entry, subtree, None, activity)?);
+            }
+        }
+        if let Some(rule) = rule_of("superseded_copies") {
+            for path in self.superseded_copies(scan, &root, &home, &directory_roots)? {
+                let Some(entry) = self.entry_at(scan, &path)? else {
+                    continue;
+                };
+                directory_roots.push(entry.path.clone());
+                let subtree = self.subtree(&entry.path)?;
+                output.extend(assemble(rule, entry, subtree, None, None)?);
             }
         }
         // Last of the folder kinds: only what no rule above explains.
@@ -1385,7 +1700,31 @@ impl Index {
                 };
                 directory_roots.push(entry.path.clone());
                 let subtree = self.subtree(&entry.path)?;
-                output.extend(assemble(rule, entry, subtree)?);
+                output.extend(assemble(rule, entry, subtree, None, None)?);
+            }
+        }
+        if let Some(rule) = rule_of("fast_growing") {
+            let report = self.grew(200)?;
+            let since = report.since.map(|at| (crate::now() - at).max(0) / 86_400);
+            for grown in report.items {
+                if grown.change < GROWTH_MIN_BYTES
+                    || directory_roots.iter().any(|d| {
+                        policy::inside(&grown.path, d, true) || policy::inside(d, &grown.path, true)
+                    })
+                {
+                    continue;
+                }
+                let Some(entry) = self.entry_at(scan, &grown.path)? else {
+                    continue;
+                };
+                let note = format!(
+                    "grew by {} MB since the scan {} days earlier",
+                    grown.change >> 20,
+                    since.unwrap_or(0)
+                );
+                directory_roots.push(entry.path.clone());
+                let subtree = self.subtree(&entry.path)?;
+                output.extend(assemble(rule, entry, subtree, Some(note), None)?);
             }
         }
         if let Some(rule) = catalog
@@ -1407,7 +1746,7 @@ impl Index {
                 {
                     continue; // already inside a directory finding's estimate
                 }
-                output.extend(assemble(rule, entry, None)?);
+                output.extend(assemble(rule, entry, None, None, None)?);
             }
         }
         output.sort_by(|a, b| {
@@ -1895,6 +2234,164 @@ impl Index {
             )
             .optional()?)
     }
+    /// Installers, disk images and archives in the Downloads folder, untouched for a month: what
+    /// they installed or unpacked lives elsewhere, and they can be downloaded again.
+    fn old_installers(
+        &self,
+        scan: i64,
+        root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> Result<Vec<Vec<u8>>> {
+        let Some(downloads) =
+            crate::rollup::relative_raw(root, &home.join("Downloads")).filter(|d| !d.is_empty())
+        else {
+            return Ok(vec![]);
+        };
+        let cutoff = (now() - INSTALLER_DAYS * 86_400) as i128 * 1_000_000_000;
+        let mut upper = downloads.clone();
+        upper.push(b'0');
+        let mut below = downloads.clone();
+        below.push(b'/');
+        let mut statement = self.db.prepare_cached(
+            "SELECT CAST(parent||name AS BLOB) FROM entries WHERE scan_id=?1 AND parent=?4 AND kind='file' AND excluded IS NULL AND allocated>=?2 AND modified_ns<?3 UNION ALL SELECT CAST(parent||name AS BLOB) FROM entries WHERE scan_id=?1 AND parent>=?5 AND parent<?6 AND kind='file' AND excluded IS NULL AND allocated>=?2 AND modified_ns<?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                scan,
+                INSTALLER_MIN_BYTES,
+                cutoff as i64,
+                downloads,
+                below,
+                upper
+            ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?;
+        let mut out = Vec::new();
+        for path in rows {
+            let path = path?;
+            let name =
+                String::from_utf8_lossy(crate::index::split_path(&path).1).to_ascii_lowercase();
+            if INSTALLER_EXTENSIONS.iter().any(|ext| {
+                name.strip_suffix(ext)
+                    .is_some_and(|stem| stem.ends_with('.') && stem.len() > 2)
+            }) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+    /// Older copies of a folder: sibling folders holding the same files (names compared with their
+    /// digits folded, so `app-1.2.tgz` and `app-1.3.tgz` count as the same file), mostly build or
+    /// release output, where a newer sibling exists. Every copy but the newest is listed for
+    /// review; nothing is suggested. Metadata only, and bounded: a few hundred parents, a few
+    /// thousand files per folder.
+    fn superseded_copies(
+        &self,
+        scan: i64,
+        root: &std::path::Path,
+        home: &std::path::Path,
+        claimed: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>> {
+        let Some(home_raw) = crate::rollup::relative_raw(root, home) else {
+            return Ok(vec![]);
+        };
+        let mut groups = self.db.prepare_cached(
+            "SELECT parent FROM dir_totals WHERE scan_id=? AND allocated>=? AND parent IS NOT NULL GROUP BY parent HAVING count(*)>=2 ORDER BY sum(allocated) DESC LIMIT ?",
+        )?;
+        let parents: Vec<Vec<u8>> = groups
+            .query_map(params![scan, COPY_MIN_BYTES, COPY_PARENTS], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut members = self.db.prepare_cached(
+            "SELECT path,coalesce(newest,0) FROM dir_totals WHERE scan_id=? AND parent=? AND allocated>=? ORDER BY allocated DESC LIMIT 12",
+        )?;
+        let mut files = self.db.prepare_cached(
+            "SELECT CAST(parent||name AS BLOB),apparent FROM entries WHERE scan_id=?1 AND parent=?2 AND kind='file' AND excluded IS NULL UNION ALL SELECT CAST(parent||name AS BLOB),apparent FROM entries WHERE scan_id=?1 AND parent>=?3 AND parent<?4 AND kind='file' AND excluded IS NULL LIMIT ?5",
+        )?;
+        let mut budget = COPY_ENTRY_BUDGET;
+        let mut out = Vec::new();
+        for parent in parents {
+            let below_home = policy::inside(&parent, &home_raw, true);
+            let relative = parent.strip_prefix(home_raw.as_slice()).unwrap_or(&parent);
+            // Only the user's own folders: tool areas, application data and dependency trees keep
+            // versions side by side on purpose, and their own kinds judge them.
+            let tool_area = relative.split(|b| *b == b'/').any(|part| {
+                part.first() == Some(&b'.')
+                    || part.eq_ignore_ascii_case(b"Library")
+                    || part.eq_ignore_ascii_case(b"AppData")
+                    || policy::REGENERABLE.iter().any(|r| r.as_bytes() == part)
+            });
+            if !below_home || tool_area || claimed.iter().any(|c| policy::inside(&parent, c, true))
+            {
+                continue;
+            }
+            let mut copies: Vec<FolderCopy> = Vec::new();
+            let rows: Vec<(Vec<u8>, i64)> = members
+                .query_map(params![scan, parent, COPY_MIN_BYTES], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (dir, newest) in rows {
+                if budget == 0 {
+                    return Ok(out);
+                }
+                let mut git = dir.clone();
+                git.extend_from_slice(b"/.git");
+                if self.entry_at(scan, &git)?.is_some()
+                    || claimed.iter().any(|c| policy::inside(c, &dir, true))
+                {
+                    continue;
+                }
+                let mut below = dir.clone();
+                below.push(b'/');
+                let mut upper = dir.clone();
+                upper.push(b'0');
+                let listed: Vec<(Vec<u8>, i64)> = files
+                    .query_map(
+                        params![scan, dir, below, upper, COPY_MAX_FILES as i64 + 1],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<_>>()?;
+                budget = budget.saturating_sub(listed.len());
+                if listed.len() > COPY_MAX_FILES || listed.len() < 3 {
+                    continue;
+                }
+                let mut names = BTreeSet::new();
+                let (mut bytes, mut artifact_bytes) = (0u64, 0u64);
+                for (path, apparent) in listed {
+                    let rest = &path[dir.len()..];
+                    if rest
+                        .split(|b| *b == b'/')
+                        .any(|part| policy::REGENERABLE.iter().any(|r| r.as_bytes() == part))
+                    {
+                        continue;
+                    }
+                    let size = apparent.max(0) as u64;
+                    bytes += size;
+                    let name = crate::index::split_path(&path).1;
+                    if build_artifact(name.strip_prefix(b"/").unwrap_or(name)) {
+                        artifact_bytes += size;
+                    }
+                    names.insert(fold_digits(rest));
+                }
+                if bytes >= COPY_MIN_BYTES as u64 && artifact_bytes * 2 >= bytes {
+                    copies.push((dir, newest, names, bytes));
+                }
+            }
+            copies.sort_by_key(|c| std::cmp::Reverse(c.1));
+            for (i, candidate) in copies.iter().enumerate().skip(1) {
+                let superseded = copies[..i].iter().any(|keeper| {
+                    keeper.1 > candidate.1
+                        && similar(&keeper.2, &candidate.2)
+                        && keeper.3 * 2 >= candidate.3
+                        && candidate.3 * 2 >= keeper.3
+                });
+                if superseded {
+                    out.push(candidate.0.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
     /// Items of a rule's store: each root resolved, then one level per pattern, listing only the
     /// children of folders already matched, so the cost follows the store and not the index.
     fn store_items(
@@ -2122,6 +2619,322 @@ impl Index {
         }
         Ok(out)
     }
+    /// Older settings and data folders of JetBrains IDEs, one per product and version
+    /// (`IntelliJIdea2024.1`, `PyCharm2023.3`). The newest of each product is kept; an older one is
+    /// listed once unchanged for `policy::STALE_DAYS` and the newest is a day old.
+    fn jetbrains_old_versions(
+        &self,
+        scan: i64,
+        root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> Result<Vec<Vec<u8>>> {
+        let parents: Vec<std::path::PathBuf> = if cfg!(windows) {
+            vec![
+                tool_area("{data}", home).join("JetBrains"),
+                tool_area("{cache}", home).join("JetBrains"),
+                tool_area("{data}", home).join("Google"),
+                tool_area("{cache}", home).join("Google"),
+            ]
+        } else if cfg!(target_os = "macos") {
+            vec![
+                home.join("Library/Application Support/JetBrains"),
+                home.join("Library/Logs/JetBrains"),
+                home.join("Library/Application Support/Google"),
+                home.join("Library/Logs/Google"),
+            ]
+        } else {
+            vec![
+                tool_area("{config}", home).join("JetBrains"),
+                tool_area("{data}", home).join("JetBrains"),
+                tool_area("{config}", home).join("Google"),
+                tool_area("{data}", home).join("Google"),
+            ]
+        };
+        let cutoff = crate::now() - policy::STALE_DAYS * 86_400;
+        let settled = crate::now() - 86_400;
+        let gaps = self.gaps(scan)?;
+        let mut statement = self.db.prepare(
+            "SELECT path,coalesce(newest,0) FROM dir_totals WHERE scan_id=? AND parent=? AND path<>x''",
+        )?;
+        let mut out = Vec::new();
+        for parent in parents {
+            let google = parent.ends_with("Google");
+            let Some(parent) = crate::rollup::relative_raw(root, &parent) else {
+                continue;
+            };
+            if parent.is_empty() || gaps.covers(&parent) {
+                continue;
+            }
+            let mut groups: std::collections::BTreeMap<String, Vec<VersionDir>> =
+                Default::default();
+            for row in statement.query_map(params![scan, parent], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (path, newest) = row?;
+                let name = crate::index::split_path(&path).1;
+                let name = String::from_utf8_lossy(name.strip_prefix(b"/").unwrap_or(name));
+                let Some((product, version)) = ide_version(&name) else {
+                    continue;
+                };
+                if google && product != "AndroidStudio" {
+                    continue;
+                }
+                groups
+                    .entry(product)
+                    .or_default()
+                    .push((version, newest, path));
+            }
+            for (_, mut versions) in groups {
+                versions.sort();
+                if versions
+                    .pop()
+                    .is_none_or(|(_, newest, _)| newest <= 0 || newest >= settled)
+                {
+                    continue;
+                }
+                out.extend(
+                    versions
+                        .into_iter()
+                        .filter(|(_, newest, path)| {
+                            *newest > 0 && *newest < cutoff && !gaps.covers(path)
+                        })
+                        .map(|(_, _, path)| path),
+                );
+            }
+        }
+        Ok(out)
+    }
+    /// conda and mamba environments (folders holding `conda-meta`) of 50 MB or more, unchanged for
+    /// `CONDA_ENV_DAYS`. An environment is made again from its list of packages, if one was kept.
+    fn conda_envs(
+        &self,
+        scan: i64,
+        root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> Result<Vec<Vec<u8>>> {
+        let cutoff = crate::now() - CONDA_ENV_DAYS * 86_400;
+        let gaps = self.gaps(scan)?;
+        let mut parents: Vec<std::path::PathBuf> = [
+            "miniconda3",
+            "anaconda3",
+            "miniforge3",
+            "mambaforge",
+            "micromamba",
+            ".conda",
+            ".mamba",
+        ]
+        .iter()
+        .map(|base| home.join(base).join("envs"))
+        .collect();
+        parents.extend(absolute_env("MAMBA_ROOT_PREFIX").map(|p| p.join("envs")));
+        parents.extend(absolute_env("CONDA_ENVS_PATH"));
+        parents.sort();
+        parents.dedup();
+        let mut statement = self.db.prepare(
+            "SELECT path,coalesce(newest,0),protected FROM dir_totals WHERE scan_id=? AND parent=? AND allocated>=? AND path<>x''",
+        )?;
+        let mut out = Vec::new();
+        for parent in parents {
+            if !tool_root_allowed(home, &parent) {
+                continue;
+            }
+            let Some(parent) = crate::rollup::relative_raw(root, &parent) else {
+                continue;
+            };
+            if parent.is_empty() {
+                continue;
+            }
+            let rows: Vec<(Vec<u8>, i64, i64)> = statement
+                .query_map(params![scan, parent, SUGGEST_MIN_BYTES], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (path, newest, protected) in rows {
+                let mut meta = path.clone();
+                meta.extend_from_slice(b"/conda-meta");
+                if newest > 0
+                    && newest < cutoff
+                    && protected == 0
+                    && !gaps.covers(&path)
+                    && self.entry_at(scan, &meta)?.is_some()
+                    && !out.contains(&path)
+                {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(out)
+    }
+    /// Data an application left in the per-user Library after it was removed: folders named after
+    /// an application (by bundle identifier or name) that no installed application matches,
+    /// unchanged for `LEFTOVER_DAYS`. Applications are known by their bundle names only.
+    fn app_leftovers(
+        &self,
+        scan: i64,
+        root: &std::path::Path,
+        home: &std::path::Path,
+        apps: &[String],
+    ) -> Result<Vec<Vec<u8>>> {
+        let cutoff = crate::now() - LEFTOVER_DAYS * 86_400;
+        let gaps = self.gaps(scan)?;
+        let mut known: Vec<Vec<u8>> = DISCOVERIES
+            .iter()
+            .filter_map(|kind| discovery_root(kind, home))
+            .chain(toolchains(home).into_iter().flat_map(|t| t.roots))
+            .filter_map(|p| crate::rollup::relative_raw(root, &p))
+            .collect();
+        known.retain(|p| !p.is_empty());
+        let mut statement = self.db.prepare(
+            "SELECT path,coalesce(newest,0),protected FROM dir_totals WHERE scan_id=? AND parent=? AND allocated>=? AND path<>x''",
+        )?;
+        let mut out = Vec::new();
+        for area in [
+            "Library/Application Support",
+            "Library/Saved Application State",
+            "Library/HTTPStorages",
+            "Library/WebKit",
+        ] {
+            let Some(parent) = crate::rollup::relative_raw(root, &home.join(area)) else {
+                continue;
+            };
+            if parent.is_empty() {
+                continue;
+            }
+            let rows: Vec<(Vec<u8>, i64, i64)> = statement
+                .query_map(params![scan, parent, 1i64 << 20], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (path, newest, protected) in rows {
+                let name = crate::index::split_path(&path).1;
+                let name = String::from_utf8_lossy(name.strip_prefix(b"/").unwrap_or(name))
+                    .to_ascii_lowercase();
+                if name.starts_with('.')
+                    || name.starts_with("com.apple.")
+                    || name.starts_with("group.com.apple.")
+                    || APP_DATA_SKIP.contains(&name.as_str())
+                    || protected != 0
+                    || newest <= 0
+                    || newest >= cutoff
+                    || gaps.covers(&path)
+                    || known
+                        .iter()
+                        .any(|k| policy::inside(&path, k, true) || policy::inside(k, &path, true))
+                    || app_installed(&name, apps)
+                {
+                    continue;
+                }
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+    /// The biggest folders that no finding explains: each one's size minus the findings inside it,
+    /// followed down while one subfolder holds most of what is left.
+    pub fn unexplained(&self, limit: usize) -> Result<Vec<Unexplained>> {
+        self.unexplained_in(limit, &platform::home()?)
+    }
+    pub fn unexplained_in(&self, limit: usize, home: &std::path::Path) -> Result<Vec<Unexplained>> {
+        let Some(scan) = self
+            .db
+            .query_row("SELECT scan_id FROM active WHERE singleton=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+        else {
+            return Ok(vec![]);
+        };
+        let findings = self.findings_in(1000, 0, true, home)?;
+        let explained = |path: &[u8]| -> (u64, bool) {
+            let mut bytes = 0;
+            for f in &findings {
+                if policy::inside(path, &f.entry.path, true) {
+                    return (0, true);
+                }
+                if policy::inside(&f.entry.path, path, true) {
+                    bytes += f.estimate;
+                }
+            }
+            (bytes, false)
+        };
+        let mut statement = self.db.prepare(
+            "SELECT path,allocated FROM dir_totals WHERE scan_id=? AND parent=? AND path<>x'' ORDER BY allocated DESC LIMIT 50",
+        )?;
+        let mut children = |parent: &[u8]| -> Result<Vec<(Vec<u8>, u64)>> {
+            let mut list = Vec::new();
+            for row in statement.query_map(params![scan, parent], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, crate::index::unsigned(r, 1)?))
+            })? {
+                let (path, allocated) = row?;
+                let (inside, whole) = explained(&path);
+                if !whole {
+                    list.push((path, allocated.saturating_sub(inside)));
+                }
+            }
+            Ok(list)
+        };
+        let mut out: Vec<Unexplained> = Vec::new();
+        for (mut path, mut left) in children(b"")? {
+            if left < UNEXPLAINED_MIN_BYTES {
+                continue;
+            }
+            for _ in 0..32 {
+                let Some((child, child_left)) = children(&path)?.into_iter().max_by_key(|c| c.1)
+                else {
+                    break;
+                };
+                if child_left * 5 < left * 4 {
+                    break;
+                }
+                (path, left) = (child, child_left);
+            }
+            let allocated = self.subtree(&path)?.map_or(left, |t| t.allocated);
+            out.push(Unexplained {
+                path,
+                allocated,
+                unexplained: left,
+            });
+        }
+        out.sort_by(|a, b| b.unexplained.cmp(&a.unexplained).then(a.path.cmp(&b.path)));
+        out.truncate(limit.clamp(1, 200));
+        Ok(out)
+    }
+    /// How recently the project folder `project` was worked on, split by where the change was.
+    pub fn project_activity(&self, scan: i64, project: &[u8]) -> Result<Activity> {
+        let mut activity = Activity::default();
+        let bump = |slot: &mut Option<i64>, at: i64| {
+            if at > 0 {
+                *slot = Some(slot.map_or(at, |s| s.max(at)));
+            }
+        };
+        let mut folders = self.db.prepare_cached(
+            "SELECT path,coalesce(newest,0) FROM dir_totals WHERE scan_id=? AND parent=? AND path<>x''",
+        )?;
+        let rows = folders.query_map(params![scan, project], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows.take(5000) {
+            let (path, newest) = row?;
+            let name = crate::index::split_path(&path).1;
+            let name = String::from_utf8_lossy(name.strip_prefix(b"/").unwrap_or(name));
+            if name == ".git" {
+                bump(&mut activity.git, newest);
+            } else if policy::REGENERABLE.contains(&name.as_ref())
+                || PROJECT_OUTPUT_NAMES.contains(&name.as_ref())
+            {
+                bump(&mut activity.build, newest);
+            } else {
+                bump(&mut activity.source, newest);
+            }
+        }
+        let mut files = self.db.prepare_cached(
+            "SELECT modified_ns FROM entries WHERE scan_id=? AND parent=? AND kind<>'directory' LIMIT 5000",
+        )?;
+        for at in files.query_map(params![scan, project], |r| r.get::<_, i64>(0))? {
+            bump(&mut activity.source, at? / 1_000_000_000);
+        }
+        Ok(activity)
+    }
     /// Top-level dependency folders (`node_modules` next to `package.json`, `target` next to
     /// `Cargo.toml`, Python virtual environments) outside hidden (tool/application) folders.
     fn stale_dependencies(&self, scan: i64) -> Result<Vec<Vec<u8>>> {
@@ -2171,16 +2984,129 @@ impl Index {
                 out.extend_from_slice(leaf.as_bytes());
                 out
             };
+            let beside = |files: &[&str]| -> Result<bool> {
+                for file in files {
+                    if exists(join(&parent, file))? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+            let beside_kind = |extensions: &[&str]| -> Result<bool> {
+                let mut statement = self.db.prepare_cached(
+                    "SELECT name FROM entries WHERE scan_id=? AND parent=? LIMIT 2000",
+                )?;
+                let names =
+                    statement.query_map(params![scan, parent], |r| r.get::<_, Vec<u8>>(0))?;
+                for name in names {
+                    let name = name?;
+                    if extensions.iter().any(|e| name.ends_with(e.as_bytes())) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+            let (grandparent, parent_name) = crate::index::split_path(&parent);
+            let parent_name = parent_name.strip_prefix(b"/").unwrap_or(parent_name);
+            let beside_parent = |files: &[&str]| -> Result<bool> {
+                for file in files {
+                    if exists(join(grandparent, file))? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
             let evidence = match name {
-                b"node_modules" => exists(join(&parent, "package.json"))?,
-                b"target" => exists(join(&parent, "Cargo.toml"))?,
-                b".venv" | b"venv" => exists(join(&path, "pyvenv.cfg"))?,
-                _ => false,
+                b"node_modules" | b".next" | b".nuxt" | b".svelte-kit" | b".turbo"
+                | b".parcel-cache" | b".angular" | b".expo" | b".output" | b"storybook-static"
+                | b".pnpm-store" => beside(&["package.json"])?,
+                b"out" => beside(&[
+                    "next.config.js",
+                    "next.config.mjs",
+                    "next.config.ts",
+                    "forge.config.js",
+                    "forge.config.ts",
+                ])?,
+                b".cache" | b"public" => beside(&["gatsby-config.js", "gatsby-config.ts"])?,
+                b".docusaurus" => beside(&[
+                    "docusaurus.config.js",
+                    "docusaurus.config.ts",
+                    "docusaurus.config.mjs",
+                ])?,
+                b".serverless" => beside(&["serverless.yml", "serverless.yaml", "serverless.ts"])?,
+                b"bower_components" => beside(&["bower.json"])?,
+                b"elm-stuff" => beside(&["elm.json"])?,
+                b"vendor" => beside(&["composer.json"])?,
+                // Bundler's `--path vendor/bundle`; the rest of `vendor` may be committed code.
+                b"bundle" if parent_name == b"vendor" => beside_parent(&["Gemfile"])?,
+                b"library" if parent_name == b"renv" => beside_parent(&["renv.lock"])?,
+                b"deps" | b".elixir_ls" => beside(&["mix.exs"])?,
+                b"bin" | b"obj" => beside_kind(&[".csproj", ".fsproj", ".vbproj"])?,
+                b".terraform" => beside_kind(&[".tf"])?,
+                b".terragrunt-cache" => beside(&["terragrunt.hcl"])?,
+                b"Intermediate" | b"Binaries" | b"DerivedDataCache" => beside_kind(&[".uproject"])?,
+                // Unity's own folders, beside the file only Unity writes.
+                b"Library" | b"Temp" | b"Obj" => {
+                    exists(join(&parent, "ProjectSettings/ProjectVersion.txt"))?
+                }
+                b".godot" => beside(&["project.godot"])?,
+                b".bloop" | b".metals" | b".bsp" => beside(&["build.sbt", "build.sc"])?,
+                b".cpcache" => beside(&["deps.edn"])?,
+                b".shadow-cljs" => beside(&["shadow-cljs.edn"])?,
+                b"_opam" => beside(&["dune-project"])? || beside_kind(&[".opam"])?,
+                b".cxx" | b".externalNativeBuild" | b".kotlin" => beside(&[
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                    "settings.gradle.kts",
+                ])?,
+                b"vcpkg_installed" => beside(&["vcpkg.json"])?,
+                b".pytest_cache" | b".mypy_cache" | b".ruff_cache" | b".nox" | b".hypothesis" => {
+                    beside(&[
+                        "pyproject.toml",
+                        "setup.py",
+                        "setup.cfg",
+                        "requirements.txt",
+                        "noxfile.py",
+                        "pytest.ini",
+                    ])?
+                }
+                b".direnv" => beside(&[".envrc"])?,
+                // Ordinary names: only at the root of a Git project, where the build made them.
+                b"dist" | b"build" => {
+                    (beside(&["package.json"])? && beside(&[".git"])?)
+                        || beside(&[
+                            "build.gradle",
+                            "build.gradle.kts",
+                            "pubspec.yaml",
+                            "CMakeLists.txt",
+                            "setup.py",
+                        ])?
+                        || beside_kind(&[".xcodeproj"])?
+                }
+                b"target" => beside(&["Cargo.toml", "pom.xml", "build.sbt", "project.clj"])?,
+                b".gradle" => beside(&[
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                    "settings.gradle.kts",
+                ])?,
+                b".dart_tool" => beside(&["pubspec.yaml"])?,
+                b".tox" => beside(&["tox.ini", "pyproject.toml", "setup.py"])?,
+                b"Pods" => beside(&["Podfile"])?,
+                b".build" => beside(&["Package.swift"])?,
+                b".stack-work" => beside(&["stack.yaml"])?,
+                b"dist-newstyle" => beside(&["cabal.project"])?,
+                b"_build" => beside(&["mix.exs", "dune-project"])?,
+                b"zig-cache" | b".zig-cache" | b"zig-out" => beside(&["build.zig"])?,
+                b"cmake-build-debug" | b"cmake-build-release" => beside(&["CMakeLists.txt"])?,
+                // Any folder holding a virtual environment's marker is one, whatever its name.
+                _ => exists(join(&path, "pyvenv.cfg"))?,
             };
             // Projects live in ordinary folders. Hidden folders hold installed tools (nvm global
             // packages, editor servers, pnpm's own versions), whose dependencies are not stale
             // project output: deleting them would break the tool.
-            let hidden = path
+            let hidden = parent
                 .split(|b| *b == b'/')
                 .any(|part| part.first() == Some(&b'.'));
             if !evidence || hidden || chosen.iter().any(|c| policy::inside(&path, c, true)) {
@@ -2399,9 +3325,22 @@ mod tests {
         }
     }
     #[test]
+    fn versions_fold_to_one_name() {
+        for (a, b) in [
+            ("/app-1.2.0-beta.1.tgz", "/app-1.3.0.tgz"),
+            ("/app-0.1.0-rc2.zip", "/app-0.1.0.zip"),
+            ("/v12/lib.so", "/v13/lib.so"),
+            ("/omg-0.1.0-r3/omg", "/omg-0.1.0/omg"),
+        ] {
+            assert_eq!(fold_digits(a.as_bytes()), fold_digits(b.as_bytes()), "{a}");
+        }
+        assert_ne!(fold_digits(b"/app-1.tgz"), fold_digits(b"/app-x.tgz"));
+        assert_eq!(fold_digits(b"/a1.2.tgz"), b"/a#.tgz");
+    }
+    #[test]
     fn strict_catalog_and_tier_contract() {
         let payload = include_str!("../../../catalog/bundled.toml");
-        assert_eq!(parse(payload).unwrap().rules.len(), 43);
+        assert_eq!(parse(payload).unwrap().rules.len(), 72);
         let claude = "roots = [\"~/.claude/projects\"]";
         assert!(payload.contains(claude));
         for bad in [

@@ -102,12 +102,12 @@ const FINDS: { title: string; tag: string; body: string; note?: string }[] = [
   {
     title: "Package caches",
     tag: "package_caches",
-    body: "npm, pnpm, Yarn, Bun, pip, uv, Cargo, Go, Gradle, Maven, Homebrew, Deno, CocoaPods, Composer, and Playwright and Puppeteer browsers.",
+    body: "npm, npx, pnpm, Yarn, Bun, pip, uv, conda, Cargo, Go, Gradle and its old distributions, Maven, Ivy, Coursier, NuGet, pub, Homebrew, Deno, CocoaPods, Composer, Terraform, minikube, Julia, ccache, sccache, pre-commit, Electron, node-gyp, Cypress, Playwright and Puppeteer.",
   },
   {
     title: "Build output",
     tag: "build_artifacts",
-    body: "target beside Cargo.toml, node_modules beside package.json, Python virtualenvs (50 MB or more), and Xcode DerivedData. Details show when it was last built.",
+    body: "Build output and dependencies beside the project file that made them: Rust, Node and Next.js, Nuxt, SvelteKit, Gatsby, Gradle and Kotlin, Maven, sbt, Clojure, .NET, PHP, Ruby, R, Elixir, OCaml, Haskell, Swift, CocoaPods, Flutter, Zig, CMake, vcpkg, Terraform, Unity, Unreal, Godot and Python virtualenvs of any name, plus Xcode DerivedData. Each says when the project was last worked on; one touched this week is never suggested.",
   },
   {
     title: "Unused Git clones",
@@ -118,7 +118,7 @@ const FINDS: { title: string; tag: string; body: string; note?: string }[] = [
   {
     title: "Old tool versions",
     tag: "old_tool_versions",
-    body: "Older nvm, pyenv and rustup versions of the same line, and older VS Code and Cursor extension versions, once the newer one has settled.",
+    body: "Older nvm, pyenv and rustup versions of the same line, older JetBrains IDE and Android Studio versions, and older VS Code and Cursor extension versions, once the newer one has settled.",
   },
   {
     title: "Unused toolchains",
@@ -146,6 +146,32 @@ const FINDS: { title: string; tag: string; body: string; note?: string }[] = [
     tag: "session_history",
     body: "Claude Code, Codex, Pi, GitHub Copilot CLI, Cursor CLI and Gemini CLI sessions of 1 MB or more, unchanged for 7 days. New tools can be added by a signed catalog rule.",
     note: "your own history",
+  },
+  {
+    title: "Older copies of builds",
+    tag: "duplicates",
+    body: "Release and build folders whose files a newer sibling also has, version numbers aside. The newest copy is never listed. For review only.",
+  },
+  {
+    title: "Developer data",
+    tag: "developer_data",
+    body: "Android emulators, conda environments unused for 3 months and, on macOS, Xcode archives. For review only.",
+    note: "your own data",
+  },
+  {
+    title: "Data of removed apps",
+    tag: "app_leftovers",
+    body: "On macOS: Library folders unchanged for 3 months whose app is no longer in Applications, judged by folder names only. For review only.",
+  },
+  {
+    title: "Fast growth",
+    tag: "growth",
+    body: "Folders that grew by 256 MB or more since the scan before and nothing else explains. omg unexplained lists the biggest space no finding covers.",
+  },
+  {
+    title: "Old installers",
+    tag: "old_downloads",
+    body: "Disk images, installers and archives of 10 MB or more in Downloads, unchanged for 30 days. For review only.",
   },
   {
     title: "Stores no rule knows",
@@ -197,6 +223,7 @@ const COMMANDS: [string, string][] = [
   ["omg tree ~/code", "folder sizes under a path"],
   ["omg findings", "what can be cleaned, with explanations, as JSON"],
   ["omg grew", "which folders grew since the scan before"],
+  ["omg unexplained", "the biggest folders no finding explains"],
   ["omg clean --category logs_and_temp --older-than 14d", "list a selection and its fingerprint; add --confirm <fingerprint> to delete exactly that"],
   ["omg docker clean", "unused Docker data, through Docker itself"],
   ["omg schedule enable --hour 12", "macOS and Windows: a daily scan that never deletes (Linux: omg start)"],

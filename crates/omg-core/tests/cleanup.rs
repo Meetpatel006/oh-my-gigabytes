@@ -1266,10 +1266,27 @@ fn big_project_output_is_suggested_with_proof_of_its_owner_and_a_size_floor() {
     write_bytes(&h.join("small/Cargo.toml"), 10);
     write_bytes(&h.join("small/target/debug/app"), 1 << 20);
     write_bytes(&h.join("photos/target/holiday.jpg"), 60 << 20);
+    age(&h.join("rusty"), days_ago(10));
+    // Worked on today: its output is listed, with when, but not suggested.
+    write_bytes(&h.join("busy/Cargo.toml"), 10);
+    write_bytes(&h.join("busy/target/debug/app"), 60 << 20);
     let mut index = Index::open(state.path()).unwrap();
     scan(&mut index, h);
     index.suggest(h).unwrap();
     assert_eq!(suggested(&index), vec![b"rusty/target".to_vec()]);
+    let busy = index
+        .findings_in(1000, 0, false, h)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.entry.path == b"busy/target")
+        .unwrap();
+    let activity = busy.activity.unwrap();
+    assert!(activity.source.is_some() && activity.build.is_some() && activity.git.is_none());
+    assert!(
+        busy.reason.contains("project last worked on 0 days ago"),
+        "{}",
+        busy.reason
+    );
 
     let id = id_of(&index, b"rusty/target");
     let plan = index.prepare_delete(&[id], h).unwrap();
@@ -1525,6 +1542,10 @@ fn git(directory: &Path, arguments: &[&str]) {
     assert!(done.status.success(), "{arguments:?}: {done:?}");
 }
 
+fn days_ago(days: u64) -> std::time::SystemTime {
+    std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400)
+}
+
 fn age(path: &Path, past: std::time::SystemTime) {
     let metadata = path.symlink_metadata().unwrap();
     if metadata.is_dir() && path.file_name().is_some_and(|n| n == ".git") {
@@ -1687,6 +1708,7 @@ fn projects_are_only_deleted_on_their_own_and_transcripts_go_together() {
     }
     write_bytes(&h.join("rusty/Cargo.toml"), 10);
     write_bytes(&h.join("rusty/target/debug/app"), 60 << 20);
+    age(&h.join("rusty"), days_ago(10));
     let mut index = Index::open(state.path()).unwrap();
     scan(&mut index, h);
     index.suggest(h).unwrap();
@@ -2209,4 +2231,415 @@ fn big_old_stores_no_rule_knows_are_shown_but_never_suggested() {
             b".mystery/cache".to_vec()
         ]
     );
+}
+
+#[test]
+fn build_output_of_more_ecosystems_is_found_beside_its_project_file() {
+    let (home, state) = setup();
+    let h = home.path();
+    for (marker, output) in [
+        ("web/package.json", "web/.next/cache/blob"),
+        ("app/Package.swift", "app/.build/debug/blob"),
+        ("ios/Podfile", "ios/Pods/Lib/blob"),
+        ("droid/build.gradle.kts", "droid/build/outputs/blob"),
+        ("zigged/build.zig", "zigged/zig-out/bin/blob"),
+    ] {
+        write_bytes(&h.join(marker), 10);
+        write_bytes(&h.join(output), 60 << 20);
+    }
+    // Ordinary names without their project file are somebody's own folder.
+    write_bytes(&h.join("notes/build/drawing.psd"), 60 << 20);
+    write_bytes(&h.join("plain/Pods/blob"), 60 << 20);
+    for project in ["web", "app", "ios", "droid", "zigged"] {
+        age(&h.join(project), days_ago(10));
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    let mut found = suggested(&index);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            b"app/.build".to_vec(),
+            b"droid/build".to_vec(),
+            b"ios/Pods".to_vec(),
+            b"web/.next".to_vec(),
+            b"zigged/zig-out".to_vec(),
+        ]
+    );
+    let ids: Vec<i64> = found.iter().map(|p| id_of(&index, p)).collect();
+    let plan = index.prepare_delete(&ids, h).unwrap();
+    let report = index
+        .delete_permanently(&plan, &plan.fingerprint, h)
+        .unwrap();
+    assert_eq!(report.deleted.len(), 5, "{report:?}");
+    assert!(h.join("web/package.json").exists());
+    assert!(h.join("notes/build/drawing.psd").exists());
+}
+
+fn findings_of(index: &Index, h: &Path, kind: &str) -> Vec<Vec<u8>> {
+    let mut found: Vec<Vec<u8>> = index
+        .findings_in(1000, 0, false, h)
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.rule.discovery == kind)
+        .map(|f| f.entry.path)
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn older_copies_of_release_folders_are_listed_but_the_newest_and_personal_files_are_not() {
+    let (home, state) = setup();
+    let h = home.path();
+    for version in ["0.1.0-beta.1", "0.1.0-beta.2", "0.1.0"] {
+        for file in [
+            format!("omg-release/{version}/signed/tarballs/omg-darwin-arm64-{version}.tgz"),
+            format!("omg-release/{version}/signed/tarballs/omg-linux-x64-{version}.tgz"),
+            format!("omg-release/{version}/signed/omg"),
+        ] {
+            write_bytes(&h.join(file), 5 << 20);
+        }
+        write_bytes(
+            &h.join(format!("omg-release/{version}/signed/SHA256SUMS")),
+            300,
+        );
+    }
+    for year in ["2023", "2024"] {
+        for n in 0..4 {
+            write_bytes(&h.join(format!("photos/{year}/img-{n}.jpg")), 4 << 20);
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let day = std::time::Duration::from_secs(86_400);
+    age(&h.join("omg-release/0.1.0-beta.1"), now - day * 60);
+    age(&h.join("omg-release/0.1.0-beta.2"), now - day * 30);
+    age(&h.join("photos/2023"), now - day * 400);
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    assert_eq!(
+        findings_of(&index, h, "superseded_copies"),
+        vec![
+            b"omg-release/0.1.0-beta.1".to_vec(),
+            b"omg-release/0.1.0-beta.2".to_vec(),
+        ]
+    );
+    assert!(suggested(&index).is_empty(), "copies are for review only");
+}
+
+#[test]
+fn old_installers_in_downloads_are_listed_but_never_suggested() {
+    let (home, state) = setup();
+    let h = home.path();
+    for file in [
+        "Downloads/Tool-1.2.dmg",
+        "Downloads/fresh.pkg",
+        "Downloads/report.pdf",
+        "Downloads/sdk/node-v22.tar.gz",
+        "Downloads/tiny.zip",
+    ] {
+        write_bytes(
+            &h.join(file),
+            if file.ends_with("tiny.zip") {
+                1 << 20
+            } else {
+                12 << 20
+            },
+        );
+    }
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    for file in [
+        "Downloads/Tool-1.2.dmg",
+        "Downloads/report.pdf",
+        "Downloads/sdk/node-v22.tar.gz",
+        "Downloads/tiny.zip",
+    ] {
+        age(&h.join(file), old);
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    assert_eq!(
+        findings_of(&index, h, "old_installers"),
+        vec![
+            b"Downloads/Tool-1.2.dmg".to_vec(),
+            b"Downloads/sdk/node-v22.tar.gz".to_vec(),
+        ]
+    );
+    assert!(suggested(&index).is_empty());
+}
+
+#[test]
+fn tool_caches_of_more_ecosystems_come_from_store_rules() {
+    let (home, state) = setup();
+    let h = home.path();
+    for file in [
+        ".gradle/wrapper/dists/gradle-7.6-bin/abc/gradle.zip",
+        ".gradle/wrapper/dists/gradle-8.9-bin/def/gradle.zip",
+        ".nuget/packages/newtonsoft.json/13.0.1/lib.nupkg",
+        ".pub-cache/hosted/pub.dev/http-1.2.0/lib.dart",
+        ".npm/_npx/1a2b3c/node_modules/pkg/index.js",
+    ] {
+        write_bytes(&h.join(file), 60 << 20);
+    }
+    write_bytes(&h.join(".gradle/daemon/8.9/daemon-1.out.log"), 2 << 20);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    for folder in [
+        ".gradle/wrapper/dists/gradle-7.6-bin",
+        ".gradle/daemon",
+        ".nuget",
+        ".pub-cache",
+        ".npm",
+    ] {
+        age(&h.join(folder), old);
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    let mut found = suggested(&index);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            b".gradle/daemon/8.9/daemon-1.out.log".to_vec(),
+            b".gradle/wrapper/dists/gradle-7.6-bin".to_vec(),
+            b".npm/_npx/1a2b3c".to_vec(),
+            b".nuget/packages/newtonsoft.json/13.0.1".to_vec(),
+            b".pub-cache/hosted/pub.dev/http-1.2.0".to_vec(),
+        ]
+    );
+}
+
+#[test]
+fn output_of_more_languages_needs_its_project_file_beside_it() {
+    let (home, state) = setup();
+    let h = home.path();
+    for (marker, output) in [
+        ("dotnet/App.csproj", "dotnet/bin/Debug/blob"),
+        ("dotnet/App.csproj", "dotnet/obj/blob"),
+        ("php/composer.json", "php/vendor/pkg/blob"),
+        ("ruby/Gemfile", "ruby/vendor/bundle/ruby/blob"),
+        ("elixir/mix.exs", "elixir/deps/pkg/blob"),
+        ("infra/main.tf", "infra/.terraform/providers/blob"),
+        (
+            "game/ProjectSettings/ProjectVersion.txt",
+            "game/Library/blob",
+        ),
+        ("unreal/Shooter.uproject", "unreal/Intermediate/blob"),
+        ("elm/elm.json", "elm/elm-stuff/blob"),
+        ("py/pyvenv-3.12/pyvenv.cfg", "py/pyvenv-3.12/lib/blob"),
+    ] {
+        write_bytes(&h.join(marker), 10);
+        write_bytes(&h.join(output), 2 << 20);
+    }
+    // The same names without the file that proves which tool made them.
+    write_bytes(&h.join("scripts/bin/tool"), 2 << 20);
+    write_bytes(&h.join("gomod/go.mod"), 10);
+    write_bytes(&h.join("gomod/vendor/pkg/blob"), 2 << 20);
+    write_bytes(&h.join("notes/Library/blob"), 2 << 20);
+    write_bytes(&h.join("other/vendor/bundle/blob"), 2 << 20);
+    for folder in [
+        "dotnet", "php", "ruby", "elixir", "infra", "game", "unreal", "elm", "py", "scripts",
+        "gomod", "notes", "other",
+    ] {
+        age(&h.join(folder), days_ago(40));
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    assert_eq!(
+        findings_of(&index, h, "stale_dependencies"),
+        vec![
+            b"dotnet/bin".to_vec(),
+            b"dotnet/obj".to_vec(),
+            b"elixir/deps".to_vec(),
+            b"elm/elm-stuff".to_vec(),
+            b"game/Library".to_vec(),
+            b"infra/.terraform".to_vec(),
+            b"php/vendor".to_vec(),
+            b"py/pyvenv-3.12".to_vec(),
+            b"ruby/vendor/bundle".to_vec(),
+            b"unreal/Intermediate".to_vec(),
+        ]
+    );
+}
+
+#[test]
+fn read_only_go_modules_are_found_and_deleted_whole() {
+    let (home, state) = setup();
+    let h = home.path();
+    let module = h.join("go/pkg/mod/example.com/lib@v1.2.3");
+    write_bytes(&module.join("sub/lib.go"), 4096);
+    for dir in [module.join("sub"), module.clone()] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    assert_eq!(
+        findings_of(&index, h, "go_modules"),
+        vec![b"go/pkg/mod".to_vec()]
+    );
+    index.mark(b"go/pkg/mod", 4096, h).unwrap();
+    let id = id_of(&index, b"go/pkg/mod");
+    let plan = index.prepare_delete(&[id], h).unwrap();
+    let result = index.delete_permanently(&plan, &plan.fingerprint, h);
+    if module.exists() {
+        for dir in [module.clone(), module.join("sub")] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let report = result.unwrap();
+    assert!(!h.join("go/pkg/mod").exists(), "{report:?}");
+    // Outside a tool's cache a read-only folder is the user's choice: it stays.
+    write_bytes(&h.join("keep/locked/file"), 10);
+    fs::set_permissions(h.join("keep/locked"), fs::Permissions::from_mode(0o555)).unwrap();
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.mark(b"keep", 4096, h).unwrap();
+    let id = id_of(&index, b"keep");
+    let plan = index.prepare_delete(&[id], h).unwrap();
+    let result = index.delete_permanently(&plan, &plan.fingerprint, h);
+    fs::set_permissions(h.join("keep/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    result.unwrap();
+    assert!(h.join("keep/locked/file").exists());
+}
+
+#[test]
+fn emulators_old_environments_and_old_ide_versions_are_listed_but_not_suggested_on_their_own() {
+    let (home, state) = setup();
+    let h = home.path();
+    write_bytes(&h.join(".android/avd/Pixel_8.avd/userdata.img"), 2 << 20);
+    write_bytes(&h.join("miniconda3/envs/old/conda-meta/history"), 10);
+    write_bytes(&h.join("miniconda3/envs/old/lib/blob"), 60 << 20);
+    write_bytes(&h.join("miniconda3/envs/fresh/conda-meta/history"), 10);
+    write_bytes(&h.join("miniconda3/envs/fresh/lib/blob"), 60 << 20);
+    write_bytes(&h.join("miniconda3/envs/notenv/lib/blob"), 60 << 20);
+    for env in ["old", "notenv"] {
+        age(&h.join("miniconda3/envs").join(env), days_ago(100));
+    }
+    // Linux runners may set XDG_DATA_HOME or XDG_CONFIG_HOME outside this home; omg then looks there.
+    let ide = if cfg!(target_os = "macos") {
+        Some(h.join("Library/Application Support/JetBrains"))
+    } else if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+        Some(h.join(".config/JetBrains"))
+    } else if std::env::var_os("XDG_DATA_HOME").is_none() {
+        Some(h.join(".local/share/JetBrains"))
+    } else {
+        None
+    };
+    let ide = ide.unwrap_or_else(|| h.join("ide-not-looked-at"));
+    let looked_at = !ide.ends_with("ide-not-looked-at");
+    for (version, days) in [
+        ("IntelliJIdea2023.3", 40),
+        ("IntelliJIdea2024.2", 2),
+        ("PyCharm2024.1", 40),
+        ("consentOptions", 40),
+    ] {
+        write_bytes(&ide.join(version).join("options/other.xml"), 4096);
+        age(&ide.join(version), days_ago(days));
+    }
+    if cfg!(target_os = "macos") {
+        write_bytes(
+            &h.join("Library/Developer/Xcode/Archives/2026-01-01/App.xcarchive/Info.plist"),
+            10,
+        );
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    assert_eq!(
+        findings_of(&index, h, "android_avd"),
+        vec![b".android/avd".to_vec()]
+    );
+    assert_eq!(
+        findings_of(&index, h, "conda_envs"),
+        vec![b"miniconda3/envs/old".to_vec()]
+    );
+    let relative = ide.strip_prefix(h).unwrap().to_string_lossy().into_owned();
+    let old_ide = if looked_at {
+        vec![format!("{relative}/IntelliJIdea2023.3").into_bytes()]
+    } else {
+        vec![]
+    };
+    assert_eq!(findings_of(&index, h, "jetbrains_old_versions"), old_ide);
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            findings_of(&index, h, "xcode_archives"),
+            vec![b"Library/Developer/Xcode/Archives".to_vec()]
+        );
+    }
+    let marked = suggested(&index);
+    assert_eq!(
+        marked, old_ide,
+        "emulators, environments and archives are only listed"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn data_of_removed_apps_is_listed_and_data_of_installed_ones_is_not() {
+    let (home, state) = setup();
+    let h = home.path();
+    fs::create_dir_all(h.join("Applications/Present Thing.app/Contents")).unwrap();
+    for (folder, days) in [
+        (
+            "Library/Application Support/com.omgpresentvendor.presentthing",
+            100,
+        ),
+        (
+            "Library/Application Support/com.omgvanishedvendor.vanishedtool",
+            100,
+        ),
+        (
+            "Library/Application Support/com.omgvanishedvendor.recenttool",
+            1,
+        ),
+        ("Library/Application Support/com.apple.omgsomething", 100),
+    ] {
+        write_bytes(&h.join(folder).join("Data/blob"), 2 << 20);
+        age(&h.join(folder), days_ago(days));
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    assert_eq!(
+        findings_of(&index, h, "app_leftovers"),
+        vec![b"Library/Application Support/com.omgvanishedvendor.vanishedtool".to_vec()]
+    );
+    assert!(suggested(&index).is_empty());
+}
+
+#[test]
+fn fast_growth_and_unexplained_space_are_reported_from_metadata() {
+    let (home, state) = setup();
+    let h = home.path();
+    // Several files below the large-file size, so no finding explains them.
+    for n in 0..3 {
+        write_bytes(&h.join(format!("archive/stuff/part{n}")), 90 << 20);
+    }
+    write_bytes(&h.join("small/blob"), 1 << 20);
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    let unexplained = index.unexplained_in(10, h).unwrap();
+    let paths: Vec<&[u8]> = unexplained.iter().map(|u| u.path.as_slice()).collect();
+    assert_eq!(paths, vec![b"archive/stuff".as_slice()]);
+    assert!(findings_of(&index, h, "fast_growing").is_empty());
+
+    for n in 0..3 {
+        write_bytes(&h.join(format!("renders/out/frame{n}")), 90 << 20);
+    }
+    let mut index = Index::open(state.path()).unwrap();
+    scan(&mut index, h);
+    index.suggest(h).unwrap();
+    assert_eq!(
+        findings_of(&index, h, "fast_growing"),
+        vec![b"renders/out".to_vec()]
+    );
+    assert!(suggested(&index).is_empty());
+    // Explained now, so only the older folder is left unexplained.
+    let unexplained = index.unexplained_in(10, h).unwrap();
+    let paths: Vec<&[u8]> = unexplained.iter().map(|u| u.path.as_slice()).collect();
+    assert_eq!(paths, vec![b"archive/stuff".as_slice()]);
 }
