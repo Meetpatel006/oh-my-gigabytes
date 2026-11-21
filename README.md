@@ -6,6 +6,9 @@ OMG (Oh My Gigabytes) shows where your disk space went and helps you take it bac
 
 > **`0.1.0`, a development preview.** Scanning reads names, sizes and times, not the contents of your files. The one exception: to tell whether an old Git clone has nothing local to lose, it reads Git's own config and branch references. Nothing is uploaded. Delete is permanent and not qualified: read [Deleting files](#deleting-files) first.
 
+<img width="1171" height="551" alt="image" src="https://github.com/user-attachments/assets/b861e72f-6ac0-42f8-a5e6-f528a6db3c1c" />
+
+
 ## Platforms
 
 | System | Scans | Deletes on | Notes |
@@ -59,10 +62,6 @@ Folders omg cannot read show as `unknown`, never as empty. On macOS, allow your 
 ## If the index is damaged
 
 omg refuses to use an index it cannot read and changes nothing. Move its state folder aside (`~/Library/Application Support/omg` on macOS, `~/.local/state/omg` on Linux, `%LOCALAPPDATA%\omg` on Windows, or `--state-dir`) and scan again.
-
-## Not in this release
-
-Moving to the system trash, a macOS or Windows background service, Authenticode signing, Apple notarization, Intel Macs, Windows on Arm and musl.
 
 ## More
 
