@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/banner.png" alt="OMG (Oh My Gigabytes): see where your disk went. npm i -g oh-my-gigabytes" width="100%">
+  <img src=".github/banner.png" alt="OMG (Oh My Gigabytes): see where your disk went." width="100%">
 </p>
 
 <p align="center">
