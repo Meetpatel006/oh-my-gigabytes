@@ -41,7 +41,9 @@ omg
 
 The first launch scans your home folder. On macOS, give your terminal Full Disk Access in System Settings › Privacy & Security so it can read Desktop, Documents and Downloads.
 
-<img width="1171" height="551" alt="The OMG interface: header with disk usage, tabs for Overview, Browse, Findings, OMG Trash and Deleted, and a list of folders by size" src="https://github.com/user-attachments/assets/b861e72f-6ac0-42f8-a5e6-f528a6db3c1c" />
+<img src=".github/screenshot-light.png" alt="The OMG interface in the light theme: header with disk usage, tabs for Overview, Browse, Findings, OMG Trash and Deleted, and the biggest folders by size" width="100%">
+
+<img src=".github/screenshot-dark.png" alt="The same OMG interface in the dark theme" width="100%">
 
 ## Keys
 
