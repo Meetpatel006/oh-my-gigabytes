@@ -94,7 +94,7 @@ const STEPS = [
   {
     title: "Confirm",
     cmd: "d  /  D",
-    body: "\"Are you sure?\" shows the exact paths and sizes, with Cancel as the default. Each item is re-checked just before it is removed, and skipped if it changed.",
+    body: "\"Are you sure?\" shows the exact paths and sizes, with Cancel as the default. Each item is re-checked just before it is removed, and skipped if it changed. Or turn on auto delete once, and omg removes what stays unchanged in the list for the period you pick.",
   },
 ];
 
@@ -206,10 +206,12 @@ const KEYS: [string, string][] = [
   ["2", "Browse: folders by size"],
   ["3", "Findings: what can be cleaned and why"],
   ["4", "OMG Trash: what you or the scan picked"],
+  ["5", "Deleted: what was removed, and by whom"],
   ["↑ ↓  j k", "move"],
   ["⏎  ⌫", "open, go back"],
   ["␣", "add to or remove from OMG Trash"],
   ["u", "remove from the list"],
+  ["K", "keep an item out of auto delete"],
   ["d", "delete the selected item"],
   ["D", "delete everything listed"],
   ["r", "scan again"],
@@ -225,6 +227,9 @@ const COMMANDS: [string, string][] = [
   ["omg grew", "which folders grew since the scan before"],
   ["omg unexplained", "the biggest folders no finding explains"],
   ["omg clean --category logs_and_temp --older-than 14d", "list a selection and its fingerprint; add --confirm <fingerprint> to delete exactly that"],
+  ["omg trash --add ~/old-project", "add a path to OMG Trash from the shell (--remove takes it out)"],
+  ["omg auto-delete on --every 7", "after a typed yes, delete what stayed unchanged in OMG Trash for 7 days (also 1, 30 or 180)"],
+  ["omg auto-delete status --items", "why each item is due, waiting or kept"],
   ["omg docker clean", "unused Docker data, through Docker itself"],
   ["omg schedule enable --hour 12", "macOS and Windows: a daily scan that never deletes (Linux: omg start)"],
   ["omg doctor", "read-only health check"],
@@ -246,6 +251,7 @@ const RULES = [
   "Protection rules run separately from the finding catalog. A catalog rule can only explain, never grant a delete.",
   "Every delete is a plan you confirm. Before removing each item omg checks it is still the same file, and skips it if not.",
   "Whole projects and an app's data are deleted only after you confirm them in the interface, never by omg clean.",
+  "Auto delete is off until you turn it on. It takes only items that waited the whole period in OMG Trash without changing, runs on mains power by default, needs a second permission for repositories, app data and toolchains, and stops the moment you turn it off.",
   "No telemetry. Notifications and default diagnostics never contain paths or file names.",
   "The npm package runs no install scripts and downloads nothing. Every launch re-verifies the binary against an Ed25519-signed manifest.",
 ];
@@ -263,7 +269,7 @@ const FAQ: { q: string; a: React.ReactNode }[] = [
   },
   {
     q: "Does OMG Trash move my files?",
-    a: "No. It is a saved list of paths. Nothing moves until you press d or D and choose \"Yes, delete permanently\". OMG does not use the system trash in this release, so there is no undo.",
+    a: "No. It is a saved list of paths. Nothing moves until you press d or D and choose \"Yes, delete permanently\", or until you turn on auto delete, which removes only what stayed unchanged in the list for the period you chose. OMG does not use the system trash in this release, so there is no undo.",
   },
   {
     q: "Does anything leave my machine?",
@@ -281,7 +287,7 @@ const FAQ: { q: string; a: React.ReactNode }[] = [
     q: "Can it scan in the background?",
     a: (
       <>
-        On Linux, <code>omg start</code> runs an optional per-user service. On macOS and Windows, <code>omg schedule enable</code> registers a daily scan. Both only scan; neither deletes anything.
+        On Linux, <code>omg start</code> runs an optional per-user service. On macOS and Windows, <code>omg schedule enable</code> registers a daily scan. Both only scan; neither deletes anything. Deleting in the background is a separate, opt-in feature: <code>omg auto-delete on</code> (or Auto delete in the <code>m</code> menu) asks for a typed yes, and <code>omg auto-delete off</code> withdraws it at once.
       </>
     ),
   },
@@ -366,8 +372,8 @@ export default async function Home() {
               <span>Names, sizes and times. Only Git&apos;s own config, refs and index are read, to judge old clones.</span>
             </li>
             <li>
-              <strong>You confirm every delete</strong>
-              <span>Suggestions go to a list. Nothing moves until you say yes.</span>
+              <strong>Nothing goes without your yes</strong>
+              <span>Suggestions go to a list. Nothing moves until you confirm, or turn on auto delete for that list.</span>
             </li>
           </ul>
 
