@@ -19,9 +19,6 @@
 
 **OMG (Oh My Gigabytes)** shows where your disk space went and helps you take it back. It scans file metadata on your machine, explains which caches, build folders and leftovers take space, and deletes only what you confirm. Nothing is uploaded.
 
-> [!WARNING]
-> **`0.2.0` is a development preview.** Delete is permanent. Read [Deleting files](#deleting-files) first.
-
 ## Features
 
 - **Finds developer clutter:** package caches, build output, old toolchains and IDE versions, AI tool sessions, models, Docker leftovers and large files.
