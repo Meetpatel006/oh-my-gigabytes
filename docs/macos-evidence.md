@@ -207,6 +207,24 @@ Mac17,9 (Apple silicon), macOS 27.2.1 (26B131), Terminal.app. Commit `739f959`, 
 
 Found, not fixed in 0.1.0: `omg tree` on an excluded folder itself (for example `~/.ssh`) prints `allocated: 0` and `incomplete: false`, with no `excluded` field; the listing of its parent shows it correctly as not scanned. The same on Windows for `OneDrive`.
 
+## Final check of the 0.2.0 release build (2026-11-27)
+
+Same Mac, macOS 27.2. Commit `06919e2`, `Release build` run 45944007561, signed by the owner with the production key (`sign-release.js --publishable`, fingerprint `01deacfe...9adc0`). Every step used its own private state folder and a throwaway `HOME` under `/private/tmp`.
+
+| Step | Result |
+| --- | --- |
+| Signed output | Pass: every file matches `SHA256SUMS`; `verify-release.js` verifies both the npm and offline artifacts; manifest capabilities `analysis: development-macos`, `cleanup: development-unqualified`, `service: disabled`; the binary is arm64 with a minimum of macOS 15.0. |
+| Commands | Pass: `doctor`, `scan`, `status`, `findings`, `trash`, `tree`, `grew`, `trends`, `history`, `unexplained`, `catalog status`, `schedule status`, `auto-delete status --items`, `theme`, `ignores`, `prune` and `docker` exit 0; `service status` gives the macOS refusal. |
+| Scripted delete | Pass: `omg clean` refuses `large_files` and a wrong fingerprint (exit 1) and deletes the listed logs folder with the right one. |
+| `qualify-delete.py` | Pass: 7 of 7. |
+| Interface | Pass, driven through a pseudo-terminal: both themes paint their background, all tabs, `?` and the `m` menu (Auto delete, Auto-add, Docker, Theme); exits 0. |
+| Upgrade | Pass: a copy of a real schema 14 state migrated to 15 with `integrity_check` ok; 7 OMG Trash items, 49 findings and the freed total kept. |
+| Home scan without Full Disk Access | Pass: 714K entries in 4.5 s, 141 MB peak memory; 440 folders unreadable; published only with `--accept-gaps`, with the Full Disk Access hint. |
+| Auto delete end to end | Pass, with a temporary test: the job was registered through a stand-in `launchctl` into a throwaway agents folder (`plutil -lint` passes; `RunAtLoad`, `StartInterval` 21600, low priority); its `ProgramArguments` were run as launchd would. Off: "auto delete is off". On with a 1-day period: nothing due on the first run; after two days in OMG Trash only the unchanged item was deleted, while the one added later, the held one and the changed one stayed; one `source='auto'` log row. A `credentials` folder and a `.pem` file could not be added. After `auto-delete off`, runs do nothing and the plist is removed. |
+| Registry install | Pass: after publishing, `npm install oh-my-gigabytes@0.2.0` runs `omg 0.2.0` and `doctor` says `development-unqualified`. |
+
+Not done: turning auto delete on with the real launchd (registers a job in the user session), a tamper test of the 0.2.0 package, iCloud placeholders inside a scanned folder, a USB drive. Found: a file named `credentials.json` in home is not protected (only the exact name `credentials` and extensions such as `.pem`, `.key`, `.env` are), so auto delete removed it in the first test run.
+
 ## Gates not passed
 
 No macOS older than 15, only one real Mac (Apple silicon, macOS 26 and 27), no Intel Mac, no iCloud placeholder inside a scanned folder, no Time Machine behaviour, no real USB drive or SMB share, no second terminal app, and no Apple notarization or code-signing identity. Full Disk Access and the CI-built package signed with the production key were checked on 2026-11-21. Auto delete (D16, [evidence.md](evidence.md)) has passed its tests on one Mac, but its launchd agent has not run after a real login, and its notification and battery check have not been seen on real hardware.

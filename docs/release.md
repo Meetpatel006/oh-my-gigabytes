@@ -129,16 +129,17 @@ A user verifies a manual download with `sha256sum -c SHA256SUMS` in the download
 
 ## Current state
 
-Published: `0.1.0` (npm `latest` and GitHub Release `v0.1.0`, 2026-11-21), `0.1.0-beta.2` (npm `beta`) and `0.1.0-beta.1`. `0.1.0` was built by `Release build` run 44874343258 on `739f959` and signed with the production key, fingerprint (`KEY-FINGERPRINT.txt`) `01deacfe588025e045419b57c4f39abd9f151294c8310e0a0dd28a18c9d9adc0`. Step 4 ran on all three systems with its signed offline packages: the Mac (including Full Disk Access, [macos-evidence.md](macos-evidence.md)), a Windows 11 PC ([windows-evidence.md](windows-evidence.md)) and WSL2 Ubuntu 24.04 ([linux-qualification.md](linux-qualification.md)).
+Published: `0.2.0` (npm `latest` and GitHub Release `v0.2.0`, 2026-11-27), `0.1.0` (2026-11-21), `0.1.0-beta.2` (npm `beta`) and `0.1.0-beta.1`. `0.2.0` declares `cleanup: development-unqualified`. It adds auto delete (decision D16), the new detections, the Findings total, small-terminal layout and the scan animation (`CHANGELOG.md`), and fixes the known issues of `0.1.0`.
 
-The next release is `0.2.0` on npm `latest`, still declaring `cleanup: development-unqualified`. It adds auto delete (decision D16), the new detections, the Findings total, small-terminal layout and the scan animation (`CHANGELOG.md`), and fixes the known issues of `0.1.0` (`docs/evidence.md`, 2026-11-26): `omg tree` on an excluded folder printed 0 bytes and `incomplete: false`; the Linux message for a link as the scan root listed several causes instead of naming the link; the scan's `estimated_total` counted the whole volume, not the root; `doctor` with `--state-dir` printed the real systemd unit path.
+`0.2.0` was built by `Release build` run 45944007561 on `06919e2` and signed with the production key, fingerprint (`KEY-FINGERPRINT.txt`) `01deacfe588025e045419b57c4f39abd9f151294c8310e0a0dd28a18c9d9adc0`, unchanged since `0.1.0`. Checks before publishing:
+- Mac: the signed packages, installed and run by hand, including delete, an upgrade of an existing index and auto delete run end to end with a stand-in `launchctl` ([macos-evidence.md](macos-evidence.md)).
+- Windows 11 and WSL2 Ubuntu 24.04: the same binaries before signing (byte-identical to the signed packages), analysis and delete ([windows-evidence.md](windows-evidence.md), [linux-qualification.md](linux-qualification.md)).
+- `Install smoke test` run 45950214300 with `source=release`, `v0.2.0`, the fingerprint and `previous_tag=v0.1.0`: passed on all eight jobs.
+- After publishing, `npm install oh-my-gigabytes@0.2.0` from the registry ran `omg 0.2.0` on the Mac.
 
-Next for `0.2.0`, in order (steps of [Releasing a version](#releasing-a-version)):
-1. `Release build` on the merged version commit, then download and sign with `--version 0.2.0 --publishable` (owner).
-2. Step 4 on the Mac, Windows and WSL2 with the signed offline packages, including turning auto delete on and off in a throwaway home and checking that `omg doctor` reports the job and `0.2.0`. Before signing, the unsigned binaries of `Release build` run 45944007561 (`06919e2`) passed the analysis and delete checks on Windows and WSL2 on 2026-11-27 ([windows-evidence.md](windows-evidence.md), [linux-qualification.md](linux-qualification.md)); the launcher, signature, tamper and auto delete on/off checks are left for the signed packages.
-3. Owner: draft GitHub Release `v0.2.0` with the same files as `0.1.0`; the notes repeat what is not in this release: moving to the system trash, a macOS or Windows background scan service, Authenticode signing, Apple notarization, Intel Macs, Windows on Arm and musl.
-4. `Install smoke test` with `source=release`, the tag `v0.2.0`, the fingerprint and `previous_tag=v0.1.0`.
-5. Owner: `npm publish` (to `latest`), platform packages first and the wrapper last, check `npm dist-tag ls oh-my-gigabytes`, publish the GitHub Release and add its date to `CHANGELOG.md`.
+Not done for `0.2.0`: the signed packages by hand on Windows and WSL2 (covered by the smoke test only), turning auto delete on and off with the real launchd, Task Scheduler or systemd, and the interface by hand on Windows.
+
+Known gap found during the checks, to fix next: secret files without a protected folder name or extension (for example `credentials.json`, `~/.npmrc`, `~/.netrc`) are not refused by `policy::hard_protection`; the `0.2.0` release notes list it under known issues.
 
 ## Not passed yet
 
