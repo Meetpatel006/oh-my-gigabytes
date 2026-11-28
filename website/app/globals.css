@@ -28,6 +28,7 @@
   --t-fg2: #4a4740;
   --t-mute: #7a766c;
   --t-dim: #7a766c;
+  --t-faint: #e2beac;
   --t-brand: #c2411c;
   --t-good: #1f7a3d;
   --t-warn: #965800;
@@ -63,6 +64,7 @@
     --t-fg2: #b9b9c4;
     --t-mute: #8a8a96;
     --t-dim: #7a7f8c;
+    --t-faint: #3d3480;
     --t-brand: #8b7cff;
     --t-good: #5cf28a;
     --t-warn: #ffb547;
@@ -98,6 +100,7 @@
   --t-fg2: #b9b9c4;
   --t-mute: #8a8a96;
   --t-dim: #7a7f8c;
+  --t-faint: #3d3480;
   --t-brand: #8b7cff;
   --t-good: #5cf28a;
   --t-warn: #ffb547;
@@ -752,6 +755,9 @@ main:focus {
 
 .t-dim {
   color: var(--t-dim);
+}
+.t-faint {
+  color: var(--t-faint);
 }
 
 .t-bold {

@@ -104,7 +104,7 @@ function replay(acts: Act[], start: Sim): Sim {
     if (a.key) sim = key(sim, a.key);
     if (a.scan) sim = finishNow(sim);
   }
-  return sim;
+  return sim.busy ? finishNow(sim) : sim;
 }
 
 export default function Terminal() {
@@ -160,10 +160,10 @@ export default function Terminal() {
     return () => observer.disconnect();
   }, []);
 
-  const scanning = sim.scan !== null;
+  const scanning = sim.scan !== null || sim.busy !== null;
   useEffect(() => {
     if (!scanning) return;
-    const id = setInterval(() => visible.current && setSim((s) => (s.scan ? tick(s) : s)), 90);
+    const id = setInterval(() => visible.current && setSim((s) => (s.scan || s.busy ? tick(s) : s)), 90);
     return () => clearInterval(id);
   }, [scanning]);
 
@@ -223,7 +223,7 @@ export default function Terminal() {
             setPressed(k);
             setSim((s) => key(s, k));
           }
-          if (a.scan) while (simRef.current.scan) await wait(120);
+          while (simRef.current.busy || (a.scan && simRef.current.scan)) await wait(120);
           await wait(a.wait ?? 650);
           setPressed(null);
         }

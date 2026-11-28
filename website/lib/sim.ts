@@ -30,7 +30,9 @@ export type Sim = {
   screen: "shell" | "tui";
   shell: Line[];
   scanned: boolean;
-  scan: { done: number; inShell: boolean } | null;
+  scan: { done: number; inShell: boolean; label: string; since: number | null } | null;
+  busy: { label: string; left: number; next: Sim } | null;
+  tick: number;
   tab: number;
   cursor: number[];
   dir: string;
@@ -228,6 +230,8 @@ export function initial(): Sim {
     shell: [],
     scanned: false,
     scan: null,
+    busy: null,
+    tick: 0,
     tab: 0,
     cursor: [0, 0, 0, 0, 0],
     dir: "~",
@@ -426,24 +430,55 @@ function finishScan(sim: Sim): Sim {
   return { ...next, message: `Scan complete: ${count(ENTRIES)} entries, 0 unreadable folders.${waiting}` };
 }
 
+const FINISH_TICKS = 10;
+const SCAN_LABELS = [
+  "Weighing gigabytes",
+  "Sniffing caches",
+  "Counting bytes",
+  "Measuring folders",
+  "Munching bytes",
+  "Digging through folders",
+  "Hunting big folders",
+  "Tallying space",
+];
+
 export function tick(sim: Sim): Sim {
-  if (!sim.scan) return sim;
-  const done = sim.scan.done + SCAN_STEP;
-  if (done >= TOTAL_FILES) return finishScan(sim);
-  return { ...sim, scan: { ...sim.scan, done } };
+  const t = sim.tick + 1;
+  if (sim.busy) {
+    if (sim.busy.left > 1) return { ...sim, tick: t, busy: { ...sim.busy, left: sim.busy.left - 1 } };
+    return { ...sim.busy.next, tick: t, busy: null };
+  }
+  if (!sim.scan) return { ...sim, tick: t };
+  const scan = sim.scan;
+  if (scan.since !== null) {
+    if (scan.since + 1 >= FINISH_TICKS) return { ...finishScan(sim), tick: t };
+    return { ...sim, tick: t, scan: { ...scan, since: scan.since + 1 } };
+  }
+  const done = Math.min(ENTRIES, scan.done + SCAN_STEP);
+  return { ...sim, tick: t, scan: { ...scan, done, since: done >= ENTRIES ? 0 : null } };
 }
 
 export function finishNow(sim: Sim): Sim {
+  if (sim.busy) return finishNow({ ...sim.busy.next, tick: sim.tick, busy: null });
   return sim.scan ? finishScan(sim) : sim;
+}
+
+function later(sim: Sim, label: string, next: Sim, ticks = 6): Sim {
+  if (next === sim || next.menu === sim.menu && next.message === sim.message && !next.menu) return next;
+  return { ...sim, menu: null, message: "", busy: { label, left: ticks, next: { ...next, busy: null } } };
 }
 
 function startScan(sim: Sim, inShell: boolean): Sim {
   if (sim.scan) return { ...sim, message: "A scan is already running." };
-  return { ...sim, scan: { done: 0, inShell }, message: "", menu: null, help: false };
+  const label = SCAN_LABELS[Math.floor(Math.random() * SCAN_LABELS.length)];
+  return { ...sim, scan: { done: 0, inShell, label, since: null }, message: "", menu: null, help: false };
 }
 
 function planDelete(sim: Sim, paths: string[]): Sim {
-  if (!paths.length) return sim;
+  return paths.length ? later(sim, "Checking", planNow(sim, paths)) : sim;
+}
+
+function planNow(sim: Sim, paths: string[]): Sim {
   const ok = paths.filter((p) => !guardOf(p));
   const denied = paths.filter((p) => guardOf(p));
   const total = ok.reduce((n, p) => n + sizeOf(sim, p), 0);
@@ -719,10 +754,9 @@ function choose(sim: Sim, c: Choice): Sim {
   if (act === "auto-grant") {
     const plugged = sim.autoDel.on ? sim.autoDel.plugged : true;
     const next = grant(closed, Number(a1), a2 === "1", plugged);
-    const message = sim.autoDel.on
-      ? "Auto delete settings saved."
-      : `Auto delete is on: items in OMG Trash for ${periodName(Number(a1))} are deleted in the background.`;
-    return { ...next, message };
+    if (sim.autoDel.on) return { ...next, message: "Auto delete settings saved." };
+    const message = `Auto delete is on: items in OMG Trash for ${periodName(Number(a1))} are deleted in the background.`;
+    return later(closed, "Turning on auto delete", { ...next, message });
   }
   if (act === "auto-period")
     return { ...closed, autoDel: { ...sim.autoDel, days: Number(a1) }, message: "Auto delete settings saved." };
@@ -739,7 +773,7 @@ function choose(sim: Sim, c: Choice): Sim {
       return toggleHold(closed, path);
     case "docker-yes": {
       const [next, n, total] = dockerRemove(closed);
-      return { ...next, message: `Docker removed ${n} item(s), ≈ ${bytes(total)}` };
+      return later(closed, "Removing through Docker", { ...next, message: `Docker removed ${n} item(s), ≈ ${bytes(total)}` }, 10);
     }
     case "cancel":
       return { ...closed, message: "Cancelled. Nothing was deleted." };
@@ -756,7 +790,7 @@ function choose(sim: Sim, c: Choice): Sim {
     case "clear-log":
       return clampCursor({ ...closed, log: [], message: "Cleared the deleted log. Nothing changed on disk." });
     case "delete":
-      return remove(sim, menu.paths ?? []);
+      return later(closed, "Deleting", remove(sim, menu.paths ?? []), 8);
     case "delete-one":
       return planDelete(closed, path ? [path] : []);
     case "delete-selected":
@@ -766,11 +800,11 @@ function choose(sim: Sim, c: Choice): Sim {
     case "unmark":
       return clampCursor(toggleTrash(closed, path));
     case "preview":
-      return path ? { ...closed, message: `Dry-run preview: ${path} · ${bytes(sizeOf(sim, path))} · nothing will change` } : closed;
+      return path ? later(closed, "Preparing preview", { ...closed, message: `Dry-run preview: ${path} · ${bytes(sizeOf(sim, path))} · nothing will change` }) : closed;
     case "open":
       return { ...closed, message: "The real app opens this folder in your file manager. The demo has no files to show." };
     case "docker":
-      return dockerPlan(closed);
+      return later(closed, "Asking Docker", dockerPlan(closed));
     case "scan":
       return startScan(closed, false);
     case "auto-trash": {
@@ -798,6 +832,7 @@ function choose(sim: Sim, c: Choice): Sim {
 }
 
 export function key(sim: Sim, k: string): Sim {
+  if (sim.busy) sim = { ...sim.busy.next, tick: sim.tick, busy: null };
   if (sim.screen !== "tui") return sim;
   const menu = sim.menu;
   if (menu) {
@@ -906,7 +941,10 @@ export function run(sim: Sim, input: string): Sim {
   }
   if (!cmd) return { ...sim, shell: [...sim.shell, echo] };
   if (cmd === "clear") return { ...sim, shell: [] };
-  if (cmd === "omg" || cmd === "omg tui") return { ...sim, shell: [...sim.shell, echo], screen: "tui" };
+  if (cmd === "omg" || cmd === "omg tui") {
+    const open: Sim = { ...sim, shell: [...sim.shell, echo], screen: "tui" };
+    return { ...open, busy: { label: "Loading", left: 5, next: open } };
+  }
   if (cmd === "help" || cmd === "omg help" || cmd === "omg --help")
     return out([
       dim("A pretend terminal with sample data. Try:"),
@@ -1348,12 +1386,15 @@ function header(sim: Sim, cols: number): Line[] {
     [s(" "), s(r1, "brand bold"), s(`   v${VERSION}`, "dim")],
     [s(" "), s(r2, "brand bold"), s("   find it · explain it · you decide", "dim")],
   ];
-  if (!sim.scanned) {
+  if (sim.busy?.label === "Loading") {
+    lines.push([s("  Loading your index…", "dim")], []);
+  } else if (!sim.scanned) {
     lines.push([s("  Nothing scanned yet. Press r to count your gigabytes.", "dim")], []);
   } else {
     lines.push([
       s("  ~"),
       s(`  ·  scanned just now  ·  ${shortCount(ENTRIES)} files  ·  ${bytes(sizeOf(sim, "~"))} indexed`, "dim"),
+      ...(sim.scan ? [s(" · a scan is running", "brand")] : []),
     ]);
     const cap = 926.3 * GiB;
     const used = 452.1 * GiB - sim.freed;
@@ -1596,18 +1637,60 @@ function help(): Line[] {
 }
 
 const FRAMES = ["·", "✢", "✳", "✶", "✻", "✽"];
-const VERBS = ["Weighing gigabytes", "Sniffing caches", "Counting bytes", "Measuring folders", "Gobbling inodes"];
+const FINISH_RATE = 250_000;
+const FINISH_FIXED = 4;
 
-function progress(sim: Sim, prefix = " "): Line {
-  const done = sim.scan!.done;
-  const step = Math.floor(done / SCAN_STEP);
+function muncher(fraction: number, tick: number, shell: boolean): Line {
+  const width = 12;
+  const pos = Math.min(Math.floor(fraction * width), width - 1);
+  const mix = (Math.imul(Math.floor(tick / 20) + 1, 2654435761) >>> 0) >>> 7;
+  const blink = tick % 20 < 3 && pos >= 5 ? mix % (pos - 3) : -1;
+  const eaten = shell ? "dim" : "faint";
+  const spark = shell ? undefined : "brand";
+  const out: Line = [];
+  for (let i = 0; i < width; i++) {
+    if (i < pos) {
+      if (pos - i === 1) out.push(s(FRAMES[tick % 6], spark));
+      else if (pos - i === 3) out.push(s(FRAMES[(tick + 3) % 6], spark));
+      else if (i === blink) out.push(s("·", spark));
+      else out.push(s("·", eaten));
+    } else if (i === pos) out.push(s(tick % 4 < 2 ? "ᗧ" : "●", shell ? "bold" : "warn bold"));
+    else out.push(s(i % 2 === 1 ? "•" : "·", "dim"));
+  }
+  return out;
+}
+
+function scanLeft(done: number, since: number | null): number {
+  if (since !== null) return Math.max(1, done / FINISH_RATE + FINISH_FIXED - since * 0.8);
+  const expected = Math.max(done, TOTAL_FILES * 0.94);
+  return (expected - done) / RATE + expected / FINISH_RATE + FINISH_FIXED;
+}
+
+function progress(sim: Sim, shell = false): Line {
+  const { done, label, since } = sim.scan!;
+  const frame = FRAMES[sim.tick % FRAMES.length];
   const pct = Math.min(1, done / TOTAL_FILES);
-  const verb = VERBS[Math.floor(step / 5) % VERBS.length];
-  const detail =
-    done > 0
-      ? `${bar(pct, 12)} ${count(done)} / ~${shortCount(TOTAL_FILES)} · ≤${(pct * 100).toFixed(0)}% · ${count(RATE)}/s · ~${duration((TOTAL_FILES - done) / RATE)} left`
-      : `${count(done)} entries · 0/s`;
-  return [s(`${prefix}${FRAMES[step % FRAMES.length]} ${verb}… `, "brand"), s(detail, "dim"), s(" (esc stops)", "dim")];
+  const left = scanLeft(done, since);
+  if (shell) {
+    if (since !== null)
+      return [s(`${frame} ${label} finishing up: comparing, totalling folders, saving · ${done} entries · ~${left.toFixed(0)}s left`)];
+    if (done === 0) return [s(`${done} entries · 0/s`)];
+    return [
+      s(`${frame} ${label} `),
+      ...muncher(pct, sim.tick, true),
+      s(` ${done} / ~${TOTAL_FILES} · ≤${(pct * 100).toFixed(0)}% · ${RATE}/s · ~${left.toFixed(0)}s left`),
+    ];
+  }
+  const head = s(` ${frame} ${label} `, "brand");
+  if (since !== null)
+    return [head, s(`finishing up: comparing, totalling folders, saving · ~${duration(left)} left`, "dim"), s(" (esc stops)", "dim")];
+  if (done === 0) return [head, s(`${count(done)} entries · 0/s`, "dim"), s(" (esc stops)", "dim")];
+  return [
+    head,
+    ...muncher(pct, sim.tick, false),
+    s(` ${count(done)} / ~${shortCount(TOTAL_FILES)} · ≤${(pct * 100).toFixed(0)}% · ${count(RATE)}/s · ~${duration(left)} left`, "dim"),
+    s(" (esc stops)", "dim"),
+  ];
 }
 
 const OPTIONS: [string, string][][] = [
@@ -1660,7 +1743,7 @@ function overlay(base: Line[], menu: Menu, cols: number): Line[] {
 export function render(sim: Sim, cols = 84, rows = 30): Line[] {
   if (sim.screen === "shell") {
     const lines = [...sim.shell];
-    if (sim.scan?.inShell) lines.push(progress(sim, ""));
+    if (sim.scan?.inShell) lines.push(progress(sim, true));
     return lines;
   }
   const height = Math.max(3, rows - 12);
@@ -1673,7 +1756,9 @@ export function render(sim: Sim, cols = 84, rows = 30): Line[] {
   else body = deletedView(sim, cols, height);
   body = body.flatMap((l) => wrap(l, cols)).slice(0, height);
   while (body.length < height) body.push([]);
-  const status: Line = sim.scan
+  const status: Line = sim.busy
+    ? [s(` ${FRAMES[sim.tick % FRAMES.length]} ${sim.busy.label}… `, "brand"), s(sim.message, "dim")]
+    : sim.scan
     ? progress(sim)
     : [s(` ${sim.message}`, sim.message.startsWith("⚠") ? "warn" : "dim")];
   let screen: Line[] = [
