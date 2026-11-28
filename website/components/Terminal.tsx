@@ -53,7 +53,7 @@ const ROWS = 28;
 const KEYMAP: Record<string, string> = { Esc: "Escape", " ": " ", Spacebar: " " };
 const STRIP: [string, string][] = [
   ["r", "r"], ["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"], ["5", "5"], ["↑", "ArrowUp"], ["↓", "ArrowDown"],
-  ["⏎", "Enter"], ["⌫", "Backspace"], ["␣", " "], ["u", "u"], ["d", "d"], ["D", "D"], ["esc", "Escape"], ["q", "q"],
+  ["⏎", "Enter"], ["⌫", "Backspace"], ["␣", " "], ["u", "u"], ["d", "d"], ["D", "D"], ["K", "K"], ["m", "m"], ["esc", "Escape"], ["q", "q"],
 ];
 const HINT: Line[] = [
   [{ t: "Sample data, in your browser only. Refresh to start over.", c: "dim" }],
@@ -404,7 +404,7 @@ export default function Terminal() {
         {showPrompt &&
           (mode === "playground" ? (
             <form className="t-line prompt-line" onSubmit={submit}>
-              <span className="t-good">$ </span>
+              <span className="t-good">{sim.pending ? "> " : "$ "}</span>
               <input
                 ref={input}
                 className="prompt-input"

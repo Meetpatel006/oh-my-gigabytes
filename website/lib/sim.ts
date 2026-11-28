@@ -21,6 +21,10 @@ type Finding = {
 type Node = { size: number; files: number; dir: boolean; regen?: boolean; guard?: string };
 type Choice = { label: string; tone?: string; key?: string; act: string };
 type Menu = { title: string; tone: string; body: [string, string?][]; choices: Choice[]; cursor: number; paths?: string[] };
+type Logged = { path: string; size: number; source?: "auto" | "docker" };
+type DockerItem = { kind: string; name: string; size: number };
+type AutoDelete = { on: boolean; days: number; risky: boolean; plugged: boolean; last: string };
+type Pending = { every: number; risky: boolean; battery: boolean };
 
 export type Sim = {
   screen: "shell" | "tui";
@@ -39,12 +43,19 @@ export type Sim = {
   dismissed: string[];
   gone: string[];
   freed: number;
-  log: { path: string; size: number }[];
-  deleted: { path: string; size: number }[];
+  log: Logged[];
+  deleted: Logged[];
   menu: Menu | null;
   message: string;
   theme: Theme;
   autoTrash: boolean;
+  day: number;
+  added: Record<string, number>;
+  held: string[];
+  autoDel: AutoDelete;
+  docker: DockerItem[];
+  schedule: boolean;
+  pending: Pending | null;
 };
 
 export type Theme = "auto" | "dark" | "light";
@@ -235,7 +246,93 @@ export function initial(): Sim {
     message: WELCOME,
     theme: "auto",
     autoTrash: true,
+    day: 0,
+    added: {},
+    held: [],
+    autoDel: { on: false, days: 7, risky: false, plugged: true, last: "never" },
+    docker: DOCKER,
+    schedule: false,
+    pending: null,
   };
+}
+
+const DOCKER: DockerItem[] = [
+  { kind: "build cache", name: "a8k2m1x0q9", size: g(2.64) },
+  { kind: "dangling image", name: "sha256:3f1a9c2e7b10", size: g(1.21) },
+  { kind: "dangling image", name: "sha256:9be04d51aa62", size: m(412.3) },
+];
+const DOCKER_KEPT = "Never touched: 3 volume(s) (1.80 GiB), 1 running container(s), and images in use.";
+
+const PERIODS = [1, 7, 30, 180];
+const periodName = (d: number) => (d === 1 ? "1 day" : d === 7 ? "7 days" : d === 30 ? "1 month" : "6 months");
+const risky = (path: string) => FINDINGS.find((f) => f.path === path)?.category === "unused_clones";
+
+function daysLeft(sim: Sim, path: string): number {
+  return sim.autoDel.days - (sim.day - (sim.added[path] ?? sim.day));
+}
+
+function eligible(sim: Sim, path: string): boolean {
+  return !sim.held.includes(path) && !guardOf(path) && (sim.autoDel.risky || !risky(path));
+}
+
+const dueItems = (sim: Sim) => sim.trash.filter((p) => eligible(sim, p) && daysLeft(sim, p) <= 0);
+
+function nextLine(sim: Sim): string {
+  const due = dueItems(sim);
+  if (due.length) return `Next run takes ${due.length} item(s), ≈ ${bytes(due.reduce((n, p) => n + sizeOf(sim, p), 0))}.`;
+  const waits = sim.trash.filter((p) => eligible(sim, p)).map((p) => daysLeft(sim, p));
+  if (waits.length) return `Nothing is due yet; the next item is due in ${Math.min(...waits)} day(s).`;
+  return "Nothing in OMG Trash is waiting for auto delete.";
+}
+
+function standing(sim: Sim, path: string): string {
+  if (sim.held.includes(path)) return "kept";
+  if (risky(path) && !sim.autoDel.risky) return "left";
+  const left = daysLeft(sim, path);
+  return left <= 0 ? "due" : `in ${left}`;
+}
+
+function standingTag(sim: Sim, path: string): string {
+  const st = standing(sim, path);
+  if (st === "kept") return "  · kept from auto delete";
+  if (st === "left") return "  · left for you (needs the wider permission)";
+  if (st === "due") return "  · auto delete: next run";
+  return `  · auto delete ${st} day(s)`;
+}
+
+function standingText(sim: Sim, path: string): string {
+  const st = standing(sim, path);
+  if (st === "kept") return "kept: you chose to keep it out of auto delete";
+  if (st === "left") return "left for you: a whole repository, application data or a toolchain, which needs --include-risky";
+  if (st === "due") return "due: the next run deletes it, after checking it again";
+  return `waiting: due ${st} day(s)`;
+}
+
+function autoRun(sim: Sim): [Sim, number, number] {
+  const due = dueItems(sim);
+  if (!due.length) return [sim, 0, 0];
+  const items: Logged[] = due.map((p) => ({ path: p, size: sizeOf(sim, p), source: "auto" }));
+  const total = items.reduce((n, i) => n + i.size, 0);
+  const next = clampCursor({
+    ...sim,
+    gone: [...sim.gone, ...due],
+    log: [...items, ...sim.log],
+    deleted: [...items, ...sim.deleted],
+    trash: sim.trash.filter((p) => !due.includes(p)),
+    auto: sim.auto.filter((p) => !due.includes(p)),
+    selected: sim.selected.filter((p) => !due.includes(p)),
+    freed: sim.freed + total,
+    autoDel: { ...sim.autoDel, last: `deleted ${items.length} item(s), ≈ ${bytes(total)}` },
+  });
+  return [next, items.length, total];
+}
+
+const autoMessage = (n: number, total: number) => `OMG auto-deleted ${n} item(s), about ${bytes(total)}.`;
+
+function addToTrash(sim: Sim, paths: string[]): Pick<Sim, "trash" | "added"> {
+  const added = { ...sim.added };
+  for (const p of paths) added[p] = sim.day;
+  return { trash: [...sim.trash, ...paths], added };
 }
 
 const s = (t: string, c?: string): Seg => ({ t, c });
@@ -303,7 +400,7 @@ function suggest(sim: Sim): [Sim, number] {
   const add = findings(sim)
     .filter((f) => f.suggest && !sim.trash.includes(f.path) && !sim.dismissed.includes(f.path))
     .map((f) => f.path);
-  return [{ ...sim, trash: [...sim.trash, ...add], auto: [...sim.auto, ...add] }, add.length];
+  return [{ ...sim, ...addToTrash(sim, add), auto: [...sim.auto, ...add] }, add.length];
 }
 
 function finishScan(sim: Sim): Sim {
@@ -407,6 +504,7 @@ function unmarkAll(sim: Sim): Sim {
     trash: [],
     auto: [],
     selected: [],
+    held: [],
     dismissed: [...sim.dismissed, ...sim.trash],
     message: `Removed ${n} item(s) from OMG Trash. Nothing changed on disk.`,
   });
@@ -462,12 +560,102 @@ function toggleTrash(sim: Sim, path: string | undefined): Sim {
       trash: sim.trash.filter((p) => p !== path),
       auto: sim.auto.filter((p) => p !== path),
       selected: sim.selected.filter((p) => p !== path),
+      held: sim.held.filter((p) => p !== path),
       dismissed: [...sim.dismissed, path],
       message: "Removed from OMG Trash.",
     };
   }
   if (guardOf(path)) return { ...sim, message: `⚠ ${path} is protected: ${guardOf(path)}` };
-  return { ...sim, trash: [...sim.trash, path], message: "Added to OMG Trash. Nothing changed on disk." };
+  return { ...sim, ...addToTrash(sim, [path]), message: "Added to OMG Trash. Nothing changed on disk." };
+}
+
+function toggleHold(sim: Sim, path: string | undefined): Sim {
+  if (!path) return sim;
+  if (!sim.autoDel.on) return { ...sim, message: "Auto delete is off. Set it up in the menu (m)." };
+  if (sim.held.includes(path))
+    return { ...sim, held: sim.held.filter((p) => p !== path), message: "Auto delete may take this item again once it is due." };
+  return { ...sim, held: [...sim.held, path], message: "Kept: auto delete will not take this item. It stays in OMG Trash." };
+}
+
+function autoMenu(sim: Sim): Sim {
+  const a = sim.autoDel;
+  if (!a.on) {
+    const choices: Choice[] = [
+      { label: "Cancel", act: "dismiss" },
+      ...PERIODS.map((d) => ({ label: `Delete what has been in OMG Trash for ${periodName(d)}…`, act: `auto-ask:${d}:0` })),
+    ];
+    const body: [string, string?][] = [
+      ["OMG can delete what waits in OMG Trash for you, in the background, after the period you choose. It asks your permission first."],
+      ["Items that changed since you added them wait again, and you can keep any item out or turn it all off at any time."],
+    ];
+    return { ...sim, menu: { title: "Auto delete", tone: "brand", body, choices, cursor: 0 } };
+  }
+  const choices: Choice[] = [
+    { label: "Close", act: "dismiss" },
+    { label: "Turn auto delete off now", tone: "danger", act: "auto-off" },
+    ...PERIODS.filter((d) => d !== a.days).map((d) => ({ label: `Change the period to ${periodName(d)}`, act: `auto-period:${d}` })),
+    {
+      label: a.plugged ? "Only while plugged in: ON (also run on battery)" : "Only while plugged in: OFF (wait for power)",
+      act: "auto-plugged",
+    },
+    a.risky
+      ? { label: "Repositories, app data and toolchains: INCLUDED (leave them for me)", act: "auto-narrow" }
+      : { label: "Repositories, app data and toolchains: LEFT FOR YOU (include them…)", tone: "warn", act: `auto-ask:${a.days}:1` },
+  ];
+  const body: [string, string?][] = [
+    [`On: items are deleted once they have been in OMG Trash for ${periodName(a.days)}, unchanged.`],
+    [nextLine(sim)],
+    [`Last run: ${a.last}`],
+  ];
+  return { ...sim, menu: { title: "Auto delete", tone: "brand", body, choices, cursor: 0 } };
+}
+
+function autoAsk(sim: Sim, days: number, wide: boolean): Sim {
+  const plugged = sim.autoDel.on ? sim.autoDel.plugged : true;
+  const body: [string, string?][] = [
+    [`OMG will permanently delete items that have been in OMG Trash for ${periodName(days)}, in the background, without asking each time.`, "danger"],
+    ["Only items that have not changed since they were added. An item that changed waits again."],
+    ["Every item is checked again right before it is deleted. Protected items are never deleted."],
+    [wide ? "Whole repositories, application data and toolchains are included." : "Whole repositories, application data and toolchains are left for you."],
+    [plugged ? "It runs only while the computer is plugged in." : "It runs on battery power too."],
+    ["You get a notification after every run that deletes something. Press K in OMG Trash to keep an item out, and turn it off any time from this menu."],
+    ["Deleted items do not go to the system Trash and cannot be restored.", "danger"],
+  ];
+  const choices: Choice[] = [
+    { label: "Cancel", act: "dismiss" },
+    { label: "Yes, I give permission", tone: "danger", act: `auto-grant:${days}:${wide ? 1 : 0}` },
+  ];
+  return { ...sim, menu: { title: "Allow auto delete?", tone: "danger", body, choices, cursor: 0 } };
+}
+
+function grant(sim: Sim, days: number, wide: boolean, plugged: boolean): Sim {
+  return { ...sim, autoDel: { ...sim.autoDel, on: true, days, risky: wide, plugged } };
+}
+
+function revoke(sim: Sim): Sim {
+  return { ...sim, autoDel: { ...sim.autoDel, on: false, risky: false } };
+}
+
+function dockerPlan(sim: Sim): Sim {
+  if (!sim.docker.length) return { ...sim, message: `Docker: no dangling images or unused build cache to remove. ${DOCKER_KEPT}` };
+  const total = sim.docker.reduce((n, d) => n + d.size, 0);
+  const body: [string, string?][] = [
+    [`${sim.docker.length} item(s) · ≈ ${bytes(total)} · removed by Docker itself, no undo`, "danger"],
+    ...sim.docker.map((d): [string] => [`  ${d.kind}  ${d.name}  (${bytes(d.size)})`]),
+    [DOCKER_KEPT],
+    ["Docker's disk on this machine may take a while to shrink after this.", "warn"],
+  ];
+  const choices: Choice[] = [
+    { label: "Cancel", act: "dismiss" },
+    { label: "Yes, remove through Docker", tone: "danger", act: "docker-yes" },
+  ];
+  return { ...sim, menu: { title: "Remove unused Docker data?", tone: "danger", body, choices, cursor: 0 } };
+}
+
+function dockerRemove(sim: Sim): [Sim, number, number] {
+  const items: Logged[] = sim.docker.map((d) => ({ path: `${d.kind} ${d.name}`, size: d.size, source: "docker" }));
+  const total = items.reduce((n, i) => n + i.size, 0);
+  return [{ ...sim, docker: [], log: [...items, ...sim.log], freed: sim.freed + total }, items.length, total];
 }
 
 function optionsMenu(sim: Sim): Sim {
@@ -484,6 +672,12 @@ function optionsMenu(sim: Sim): Sim {
   if (sim.tab === 3 && sim.trash.length) {
     choices.push({ label: "Delete selected permanently…", key: "d", act: "delete-selected", tone: "danger" });
     choices.push({ label: "Empty OMG Trash permanently…", key: "D", act: "empty", tone: "danger" });
+    if (sim.autoDel.on && path)
+      choices.push({
+        label: sim.held.includes(path) ? "Let auto delete take this item again" : "Keep this item from auto delete",
+        key: "K",
+        act: "hold",
+      });
     choices.push({ label: "Remove from OMG Trash", key: "u", act: "unmark" });
     choices.push({ label: "Remove everything from OMG Trash…", key: "U", act: "unmark-all-ask" });
   }
@@ -499,6 +693,12 @@ function optionsMenu(sim: Sim): Sim {
       : "Auto-add caches to OMG Trash on scan: OFF (turn on)",
     act: "auto-trash",
   });
+  choices.push({
+    label: sim.autoDel.on
+      ? `Auto delete: ON, after ${periodName(sim.autoDel.days)} in OMG Trash (change or turn off…)`
+      : "Auto delete: OFF (set up…)",
+    act: "auto-menu",
+  });
   choices.push({ label: `Theme: ${sim.theme} (change to ${nextTheme(sim.theme)})`, act: "theme" });
   choices.push({ label: "Full rescan", key: "R", act: "scan" });
   TAB_NAMES.forEach((name, i) => {
@@ -513,8 +713,34 @@ function choose(sim: Sim, c: Choice): Sim {
   const menu = sim.menu!;
   const closed = { ...sim, menu: null };
   const path = current(sim);
-  if (c.act.startsWith("go:")) return { ...closed, tab: Number(c.act.slice(3)), details: false };
+  const [act, a1, a2] = c.act.split(":");
+  if (act === "go") return { ...closed, tab: Number(a1), details: false };
+  if (act === "auto-ask") return autoAsk(closed, Number(a1), a2 === "1");
+  if (act === "auto-grant") {
+    const plugged = sim.autoDel.on ? sim.autoDel.plugged : true;
+    const next = grant(closed, Number(a1), a2 === "1", plugged);
+    const message = sim.autoDel.on
+      ? "Auto delete settings saved."
+      : `Auto delete is on: items in OMG Trash for ${periodName(Number(a1))} are deleted in the background.`;
+    return { ...next, message };
+  }
+  if (act === "auto-period")
+    return { ...closed, autoDel: { ...sim.autoDel, days: Number(a1) }, message: "Auto delete settings saved." };
   switch (c.act) {
+    case "auto-menu":
+      return autoMenu(closed);
+    case "auto-off":
+      return { ...revoke(closed), message: "Auto delete is off. Nothing will be deleted automatically." };
+    case "auto-plugged":
+      return { ...closed, autoDel: { ...sim.autoDel, plugged: !sim.autoDel.plugged }, message: "Auto delete settings saved." };
+    case "auto-narrow":
+      return { ...closed, autoDel: { ...sim.autoDel, risky: false }, message: "Auto delete settings saved." };
+    case "hold":
+      return toggleHold(closed, path);
+    case "docker-yes": {
+      const [next, n, total] = dockerRemove(closed);
+      return { ...next, message: `Docker removed ${n} item(s), ≈ ${bytes(total)}` };
+    }
     case "cancel":
       return { ...closed, message: "Cancelled. Nothing was deleted." };
     case "dismiss":
@@ -544,7 +770,7 @@ function choose(sim: Sim, c: Choice): Sim {
     case "open":
       return { ...closed, message: "The real app opens this folder in your file manager. The demo has no files to show." };
     case "docker":
-      return { ...closed, message: "No local Docker engine in this demo. The real app asks Docker itself and lists only unused data." };
+      return dockerPlan(closed);
     case "scan":
       return startScan(closed, false);
     case "auto-trash": {
@@ -631,6 +857,7 @@ export function key(sim: Sim, k: string): Sim {
       return { ...sim, selected };
     }
     if (k === "u" && path) return clampCursor(toggleTrash(sim, path));
+    if (k === "K") return toggleHold(sim, path);
     if (k === "U") return askUnmarkAll(sim);
     if (k === "D") return planDelete(sim, [...sim.trash]);
     if (k === "d") return planDelete(sim, sim.selected.length ? [...sim.selected] : path ? [path] : []);
@@ -666,6 +893,17 @@ export function run(sim: Sim, input: string): Sim {
   const echo: Line = [s("$ ", "good"), s(input)];
   const out = (lines: Line[]): Sim => ({ ...sim, shell: [...sim.shell, echo, ...lines] });
   const dim = (t: string): Line => [s(t, "dim")];
+  if (sim.pending) {
+    const p = sim.pending;
+    const last = sim.shell[sim.shell.length - 1] ?? [];
+    const shell = [...sim.shell.slice(0, -1), [...last, s(input)]];
+    if (cmd !== "yes") return { ...sim, pending: null, shell: [...shell, [s("omg: auto delete stays off")]] };
+    const next = grant({ ...sim, pending: null }, p.every, p.risky, !p.battery);
+    return {
+      ...next,
+      shell: [...shell, [s(`omg: auto delete is on. Items in OMG Trash for ${p.every} day(s) are deleted in the background.`)]],
+    };
+  }
   if (!cmd) return { ...sim, shell: [...sim.shell, echo] };
   if (cmd === "clear") return { ...sim, shell: [] };
   if (cmd === "omg" || cmd === "omg tui") return { ...sim, shell: [...sim.shell, echo], screen: "tui" };
@@ -678,7 +916,15 @@ export function run(sim: Sim, input: string): Sim {
       [s("  omg findings", "brand"), s("      what can be cleaned and why", "dim")],
       [s("  omg grew", "brand"), s("          what grew since the scan before", "dim")],
       [s("  omg unexplained", "brand"), s("   the biggest folders no finding explains", "dim")],
+      [s("  omg tree ~/code", "brand"), s("    folder totals, biggest first", "dim")],
+      [s("  omg trash", "brand"), s("         what waits in OMG Trash", "dim")],
       [s("  omg clean --category package_caches", "brand")],
+      [s("  omg auto-delete on", "brand"), s("  delete what waited in OMG Trash (asks first)", "dim")],
+      [s("  omg auto-delete status --items", "brand")],
+      [s("  wait 7d", "brand"), s("           let 7 days pass (demo only)", "dim")],
+      [s("  omg docker clean", "brand"), s("  unused Docker data, removed by Docker", "dim")],
+      [s("  omg schedule enable", "brand"), s("  a daily scan that never deletes", "dim")],
+      [s("  omg history", "brand"), s("  ·  ", "dim"), s("omg trends", "brand"), s("  ·  ", "dim"), s("omg catalog status", "brand"), s("  ·  ", "dim"), s("omg prune", "brand")],
       [s("  omg theme light", "brand"), s("   colours: auto, dark or light", "dim")],
       [s("  omg doctor", "brand"), s("  ·  ", "dim"), s("ls", "brand"), s("  ·  ", "dim"), s("clear", "brand")],
     ]);
@@ -747,19 +993,27 @@ export function run(sim: Sim, input: string): Sim {
   if (cmd === "omg doctor")
     return out([
       [s("✓ ", "good"), s("state folder is private (0700)")],
-      [s("✓ ", "good"), s("index schema 14 is supported")],
+      [s("✓ ", "good"), s("index schema 15 is supported")],
       [s("✓ ", "good"), s("catalog: bundled")],
       [s(sim.scanned ? "✓ " : "· ", sim.scanned ? "good" : "dim"), s(sim.scanned ? "last scan complete" : "no scan yet")],
+      [
+        s(sim.autoDel.on ? "✓ " : "· ", sim.autoDel.on ? "good" : "dim"),
+        s(sim.autoDel.on ? `auto delete: on, after ${periodName(sim.autoDel.days)}; job registered` : "auto delete: off"),
+      ],
+      [s(sim.schedule ? "✓ " : "· ", sim.schedule ? "good" : "dim"), s(sim.schedule ? "daily scan: registered" : "daily scan: not registered")],
       dim("read-only: doctor never changes anything"),
     ]);
-  const clean = cmd.match(/^omg clean --category (\S+)(?: --confirm (\S+))?$/);
+  const clean = cmd.match(/^omg clean --category (\S+)(?: --older-than (\d+)d?)?(?: --confirm (\S+))?$/);
   if (clean) {
     if (!sim.scanned) return needScan();
-    const [, category, confirm] = clean;
+    const [, category, older, confirm] = clean;
     if (!CLEAN_CATEGORIES.includes(category))
       return out([[s(`omg: unknown category ${category}; try ${CLEAN_CATEGORIES.join(", ")}`, "warn")]]);
-    const picked = findings(sim).filter((f) => f.category === category && f.tier === "review" && !guardOf(f.path));
-    if (!picked.length) return out([dim(`nothing in ${category}`)]);
+    const age = (f: Finding) => (f.changed.endsWith("d ago") ? parseInt(f.changed, 10) : 0);
+    const picked = findings(sim).filter(
+      (f) => f.category === category && f.tier === "review" && !guardOf(f.path) && (!older || age(f) >= Number(older)),
+    );
+    if (!picked.length) return out([dim(older ? `nothing in ${category} older than ${older} days` : `nothing in ${category}`)]);
     const fp = (category.length * 2654435761 + picked.length * 97 + sim.gone.length).toString(16).slice(-6).padStart(6, "0");
     const total = picked.reduce((n, f) => n + sizeOf(sim, f.path), 0);
     if (confirm) {
@@ -770,9 +1024,231 @@ export function run(sim: Sim, input: string): Sim {
     return out([
       ...picked.map((f) => [s(lpad(bytes(sizeOf(sim, f.path)), 11)), s("  " + f.path)]),
       [s(`${picked.length} item(s) · ≈ ${bytes(total)} · nothing deleted yet`, "dim")],
-      [s("to delete exactly this: ", "dim"), s(`omg clean --category ${category} --confirm ${fp}`, "brand")],
+      [s("to delete exactly this: ", "dim"), s(`omg clean --category ${category}${older ? ` --older-than ${older}d` : ""} --confirm ${fp}`, "brand")],
     ]);
   }
+  const shortened = dim("(the real command prints JSON; shortened here)");
+  const waitFor = cmd.match(/^(?:wait|sleep) (\d+)(d|h)?$/);
+  if (waitFor) {
+    const days = waitFor[2] === "h" ? Math.floor(Number(waitFor[1]) / 24) : Number(waitFor[1]);
+    if (days < 1) return out([dim("less than a day passes; nothing new is due")]);
+    let next: Sim = { ...out([dim(`${days} day(s) pass…`)]), day: sim.day + days };
+    if (!next.autoDel.on) return next;
+    const [ran, n, total] = autoRun(next);
+    next = ran;
+    if (!n) return { ...next, shell: [...next.shell, dim("the auto delete job ran: nothing is due")] };
+    return {
+      ...next,
+      message: autoMessage(n, total),
+      shell: [...next.shell, [s("notification: ", "dim"), s(autoMessage(n, total), "warn")]],
+    };
+  }
+  const auto = cmd.match(/^omg auto-delete(?: (\S+))?(.*)$/);
+  if (auto) {
+    const [, sub = "status", rest] = auto;
+    const flags = rest.trim();
+    if (sub === "status" && flags === "--items") {
+      if (!sim.trash.length) return out([[s("[]")]]);
+      return out([
+        dim("size        path                                   explanation"),
+        ...sim.trash.map((p) => [
+          s(lpad(bytes(sizeOf(sim, p)), 10)),
+          s("  " + pad(truncateMiddle(p, 36), 37)),
+          s(" " + standingText(sim, p), "dim"),
+        ]),
+        shortened,
+      ]);
+    }
+    if (sub === "status") {
+      const due = dueItems(sim);
+      const a = sim.autoDel;
+      return out([
+        ...json([
+          ["enabled", String(a.on)],
+          ["period_days", String(a.days)],
+          ["include_risky", String(a.risky)],
+          ["plugged_in_only", String(a.plugged)],
+          ["due_items", String(a.on ? due.length : 0)],
+          ["due_bytes", String(a.on ? due.reduce((n, p) => n + sizeOf(sim, p), 0) : 0)],
+          ["kept", String(sim.held.filter((p) => sim.trash.includes(p)).length)],
+          ["job", a.on ? '"registered: launchd agent dev.omg.auto-delete"' : '"not registered"'],
+        ]),
+        shortened,
+      ]);
+    }
+    if (sub === "on") {
+      const every = flags.match(/--every (\S+)/)?.[1] ?? "7";
+      const days = Number(every.replace(/d$/, ""));
+      if (!PERIODS.includes(days))
+        return out([[s(`error: invalid value '${every}' for '--every <DAYS>': choose 1, 7, 30 or 180 days`, "danger")]]);
+      const wide = flags.includes("--include-risky");
+      const battery = flags.includes("--allow-battery");
+      return {
+        ...out([
+          [s(`Auto delete permanently deletes items that have been in OMG Trash for ${days} day(s), in the background, without asking each time.`)],
+          [s("- Only items that have not changed since they were added; changed items wait again.")],
+          [s("- Every item is checked again just before deletion; protected items are never deleted.")],
+          [s(`- ${wide ? "Whole repositories, application data and toolchains are included." : "Whole repositories, application data and toolchains are left for you."}`)],
+          [s(`- ${battery ? "Runs on battery power too." : "Runs only while the computer is plugged in."}`)],
+          [s("- You get a notification after each run that deletes something. Turn it off any time with `omg auto-delete off`.")],
+          [s("Deleted items do not go to the system Trash and cannot be restored.", "danger")],
+          [s("Type yes to give permission: ", "warn")],
+        ]),
+        pending: { every: days, risky: wide, battery },
+      };
+    }
+    if (sub === "off") return { ...revoke(out([[s("omg: auto delete is off")]])) };
+    if (sub === "run") {
+      const idle = (reason: string) => out([[s(`{"ran":false,"reason":"${reason}"}`)]]);
+      if (!sim.autoDel.on) return idle("auto delete is off");
+      if (!sim.scanned) return needScan();
+      const [next, n, total] = autoRun(out([]));
+      if (!n) return idle("nothing is due");
+      return {
+        ...next,
+        message: autoMessage(n, total),
+        shell: [
+          ...next.shell,
+          ...json([
+            ["ran", "true"],
+            ["deleted", String(n)],
+            ["bytes", String(total)],
+            ["skipped", "0"],
+            ["stopped", "false"],
+          ]),
+          [s("notification: ", "dim"), s(autoMessage(n, total), "warn")],
+        ],
+      };
+    }
+    return out([[s(`error: unrecognized subcommand '${sub}'`, "danger")], dim("  [possible: status, on, off, run]")]);
+  }
+  const sched = cmd.match(/^omg schedule(?: (\S+))?(?: --hour (\d+))?$/);
+  if (sched) {
+    const [, sub = "status", hour = "12"] = sched;
+    if (sub === "enable")
+      return {
+        ...out([
+          [
+            s(
+              `omg: a scan runs every day at ${hour.padStart(2, "0")}:00 while you are signed in; it never deletes anything. Remove it with \`omg schedule disable\``,
+            ),
+          ],
+        ]),
+        schedule: true,
+      };
+    if (sub === "disable")
+      return { ...out([[s(sim.schedule ? "omg: daily scan removed" : "omg: no daily scan was registered")]]), schedule: false };
+    return out(
+      json([
+        ["registered", String(sim.schedule)],
+        ["detail", sim.schedule ? '"launchd agent in ~/Library/LaunchAgents"' : '"no daily scan is registered"'],
+        ["executable_missing", "false"],
+      ]),
+    );
+  }
+  const docker = cmd.match(/^omg docker( clean)?(?: --confirm (\S+))?$/);
+  if (docker) {
+    const total = sim.docker.reduce((n, d) => n + d.size, 0);
+    const fp = (sim.docker.length * 2654435761 + 4242).toString(16).slice(-6);
+    if (!docker[1])
+      return out([
+        ...json([
+          ["endpoint", '"unix:///Users/you/.colima/default/docker.sock"'],
+          ["safe_to_remove_bytes", String(total)],
+          ["safe_to_remove", `"${bytes(total)}"`],
+          ["volumes_never_touched", "3"],
+          ["running_containers", "1"],
+        ]),
+        dim("omg: nothing removed; review with `omg docker clean`"),
+      ]);
+    if (!sim.docker.length) return out([dim("omg: nothing unused to remove")]);
+    if (docker[2]) {
+      if (docker[2] !== fp)
+        return out([
+          [s("omg: Docker changed since that plan was printed, or the fingerprint is wrong; run `omg docker clean` again to review", "danger")],
+        ]);
+      const [next, n, removed] = dockerRemove(out([]));
+      return { ...next, shell: [...next.shell, dim(`omg: Docker removed ${n} item(s), about ${bytes(removed)}; 0 kept`)] };
+    }
+    return out([
+      ...sim.docker.map((d) => [s(lpad(bytes(d.size), 11)), s(`  ${pad(d.kind, 16)}`, "dim"), s(d.name)]),
+      dim(DOCKER_KEPT),
+      [
+        s(`omg: nothing removed yet. To remove exactly these ${sim.docker.length} item(s) (${bytes(total)}), run the same command with `, "dim"),
+        s(`--confirm ${fp}`, "brand"),
+      ],
+    ]);
+  }
+  const trash = cmd.match(/^omg trash(?: (--add|--remove) (\S+))?$/);
+  if (trash) {
+    if (!sim.scanned) return needScan();
+    let next = sim;
+    const [, flag, raw] = trash;
+    if (flag) {
+      const p = raw.replace(/\/$/, "");
+      if (!TREE[p] || !alive(sim, p)) return out([[s(`omg: ${p}: not in the index`, "danger")]]);
+      if (flag === "--add") {
+        if (guardOf(p)) return out([[s(`omg: ${p} is protected: ${guardOf(p)}`, "danger")]]);
+        if (!sim.trash.includes(p)) next = { ...sim, ...addToTrash(sim, [p]) };
+      } else {
+        if (!sim.trash.includes(p)) return out([[s(`omg: ${p} is not in OMG Trash`, "danger")]]);
+        next = toggleTrash(sim, p);
+      }
+    }
+    const lines: Line[] = next.trash.length
+      ? [
+          dim("id  size        source     path"),
+          ...next.trash.map((p, i) => [
+            s(pad(String(i + 1), 4)),
+            s(lpad(bytes(sizeOf(next, p)), 10)),
+            s("  " + pad(next.auto.includes(p) ? "auto" : "user", 9), "dim"),
+            s("  " + p),
+          ]),
+          shortened,
+        ]
+      : [[s("[]")]];
+    return { ...next, message: sim.message, shell: [...sim.shell, echo, ...lines] };
+  }
+  const tree = cmd.match(/^omg tree(?: (\S+))?$/);
+  if (tree) {
+    if (!sim.scanned) return needScan();
+    const dir = (tree[1] ?? "~").replace(/\/$/, "") || "~";
+    if (!TREE[dir] || !alive(sim, dir)) return out([[s(`omg: ${dir}: not in the index`, "danger")]]);
+    const rows = children(sim, dir);
+    if (!rows.length) return out([dim(`${dir} has no folders or files in the index`)]);
+    return out([
+      dim("allocated      files   name"),
+      ...rows.map((c) => [s(lpad(bytes(c.size), 10)), s(lpad(shortCount(c.files), 10), "dim"), s("   " + nameOf(c.path) + (c.dir ? "/" : ""))]),
+      shortened,
+    ]);
+  }
+  if (cmd === "omg trends" || /^omg trends --days \d+$/.test(cmd)) {
+    if (!sim.scanned) return needScan();
+    return out([
+      dim("day          indexed      volume used"),
+      [s("30 days ago  "), s(lpad(bytes(g(205.64)), 10)), s(lpad(bytes(g(447.9)), 14), "dim")],
+      [s("14 days ago  "), s(lpad(bytes(g(209.02)), 10)), s(lpad(bytes(g(450.2)), 14), "dim")],
+      [s("today        "), s(lpad(bytes(sizeOf(sim, "~")), 10)), s(lpad(bytes(452.1 * GiB - sim.freed), 14), "dim")],
+      shortened,
+    ]);
+  }
+  if (cmd === "omg history") {
+    if (!sim.log.length) return out([[s("[]")]]);
+    return out([
+      dim("when      source  size        path"),
+      ...sim.log.map((d) => [
+        s(pad("just now", 10)),
+        s(pad(d.source ?? "user", 8), "dim"),
+        s(lpad(bytes(d.size), 10)),
+        s("  " + (d.source === "docker" ? `Docker ${d.path}` : d.path)),
+      ]),
+      shortened,
+    ]);
+  }
+  if (cmd === "omg catalog" || cmd === "omg catalog status")
+    return out([...json([["active", '"bundled"'], ["signed_imports", "0"], ["rollback_available", "false"]]), shortened]);
+  if (cmd === "omg ignores") return out([[s("[]")]]);
+  if (cmd === "omg prune") return out([[s("nothing stale remains")]]);
   if (cmd === "exit") return out([dim("this terminal lives on a web page; there is nowhere to exit to")]);
   if (cmd.startsWith("omg ")) return out([[s("omg: this demo knows only a few commands; type help", "warn")]]);
   if (cmd.startsWith("rm") || cmd.startsWith("sudo")) return out([dim("nice try. Nothing here is real.")]);
@@ -1036,22 +1512,28 @@ function trashView(sim: Sim, w: number, h: number): Line[] {
   const total = sim.trash.reduce((n, p) => n + sizeOf(sim, p), 0);
   const out: Line[] = [
     [s(`  ${sim.trash.length} item(s) · ≈ ${bytes(total)}`, "bold"), s("   saved paths only; nothing has been moved or deleted", "dim")],
-    [],
   ];
+  if (sim.autoDel.on)
+    out.push([
+      s(`  Auto delete after ${periodName(sim.autoDel.days)}: `, "warn"),
+      s(nextLine(sim), "dim"),
+    ]);
+  out.push([]);
   if (!sim.trash.length) {
     out.push([s("  Empty. In Browse or Findings press space to add something you want gone.", "dim")]);
     return out;
   }
-  const visible = Math.max(1, h - 2);
+  const visible = Math.max(1, h - out.length);
   const start = scrollStart(sim.cursor[3], sim.trash.length, visible);
   sim.trash.slice(start, start + visible).forEach((p, i) => {
     const sel = start + i === sim.cursor[3];
+    const tag = sim.autoDel.on ? standingTag(sim, p) : sim.auto.includes(p) ? "  · suggested by scan (you did not add this)" : "";
     out.push([
       s(sel ? "❯ " : "  ", "sel"),
       s(sim.selected.includes(p) ? "◉ " : "○ ", "danger"),
       s(lpad(bytes(sizeOf(sim, p)), 10) + "  ", "bold"),
-      s(truncateMiddle(p, w - 30), sel ? "sel" : undefined),
-      s(sim.auto.includes(p) ? "  · suggested by scan (you did not add this)" : "", "warn"),
+      s(truncateMiddle(p, Math.max(16, w - 18 - chars(tag).length)), sel ? "sel" : undefined),
+      s(tag, "warn"),
     ]);
   });
   return out;
@@ -1062,7 +1544,7 @@ function deletedView(sim: Sim, w: number, h: number): Line[] {
   const out: Line[] = [
     [
       s(`  ${sim.log.length} deleted · ≈ ${bytes(total)}`, "bold"),
-      s("   a text record only; lines older than 20 days are removed automatically", "dim"),
+      s("   a text record only, kept for 20 days", "dim"),
     ],
     [],
   ];
@@ -1071,15 +1553,20 @@ function deletedView(sim: Sim, w: number, h: number): Line[] {
     return out;
   }
   const today = new Date().toISOString().slice(0, 10);
-  const visible = Math.max(1, h - 2);
+  const autos = sim.log.findIndex((d) => d.source !== "auto");
+  const autoCount = autos < 0 ? sim.log.length : autos;
+  const visible = Math.max(1, h - 2 - (autoCount ? 2 : 0));
   const start = scrollStart(sim.cursor[4], sim.log.length, visible);
   sim.log.slice(start, start + visible).forEach((d, i) => {
-    const sel = start + i === sim.cursor[4];
+    const n = start + i;
+    if (autoCount && (n === start || n === autoCount))
+      out.push([s(n < autoCount ? `  Auto-deleted (${autoCount})` : "  Deleted by you", "brand")]);
+    const sel = n === sim.cursor[4];
     out.push([
       s(sel ? "❯ " : "  ", "sel"),
       s(`${today}  ${pad("just now", 9)}`, "dim"),
       s(lpad(bytes(d.size), 10) + "  ", "bold"),
-      s(truncateMiddle(d.path, w - 42), sel ? "sel" : undefined),
+      s(truncateMiddle(d.source === "docker" ? `Docker ${d.path}` : d.path, w - 42), sel ? "sel" : undefined),
     ]);
   });
   return out;
@@ -1099,6 +1586,7 @@ function help(): Line[] {
     row("D", "in OMG Trash: delete everything listed…"),
     row("u  U", "remove from OMG Trash  ·  remove everything (asks first)"),
     row("u  U", "in Deleted: remove a line  ·  clear the log (asks first)"),
+    row("K", "in OMG Trash: keep an item from auto delete (set auto delete up in the menu, m)"),
     row("capability", "permanent delete: development-unqualified · OS Trash: unsupported"),
     row("r  R", "scan  ·  full rescan        esc stops a scan"),
     row("p i o t", "preview · show in file manager · tier filter"),
@@ -1126,12 +1614,16 @@ const OPTIONS: [string, string][][] = [
   [["r", "scan"], ["2", "browse"], ["3", "findings"], ["4", "OMG Trash"], ["m", "options"]],
   [["⏎", "open"], ["⌫", "up"], ["␣", "add / remove OMG Trash"], ["d", "delete…"], ["m", "options"]],
   [["⏎", "details"], ["␣", "add / remove OMG Trash"], ["d", "delete…"], ["p", "preview"], ["t", "tier"]],
-  [["␣", "select"], ["d", "delete selected…"], ["D", "empty all…"], ["u", "remove"], ["U", "remove all…"]],
+  [["␣", "select"], ["d", "delete selected…"], ["D", "empty all…"], ["u", "remove from list"], ["U", "remove all…"]],
   [["j k", "move"], ["u", "remove line"], ["U", "clear log…"], ["m", "options"]],
 ];
 
 function optionsBar(sim: Sim, cols: number): Line[] {
-  const opts: [string, string][] = sim.menu ? [["↑↓", "choose"], ["⏎", "select"], ["esc", "cancel"]] : OPTIONS[sim.tab];
+  const opts: [string, string][] = sim.menu
+    ? [["↑↓", "choose"], ["⏎", "select"], ["esc", "cancel"]]
+    : sim.tab === 3 && sim.autoDel.on
+      ? [...OPTIONS[3], ["K", "keep from auto delete"]]
+      : OPTIONS[sim.tab];
   const line: Line = [s(" ")];
   for (const [k, label] of opts) {
     const danger = label.startsWith("delete") || label.startsWith("empty");
